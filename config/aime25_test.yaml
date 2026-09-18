@@ -1,0 +1,41 @@
+# 按列表顺序逐个评测，最后在 log 汇总模型得分表；继续加 - 路径即可。
+# 旧配置中的单个 model_path 仍可使用；同时填写时优先使用 model_paths。
+model_paths:
+  - "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-low-ep5/checkpoint-800"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/topk_merge/extraversion-high-L_contrast-top-positive1pct-alpha1"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/topk_merge/extraversion-high-L_contrast-top-positive5pct-alpha1"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/topk_merge/extraversion-high-L_contrast-top-positive10pct-alpha1"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/topk_merge/extraversion-high-L_contrast-top-positive20pct-alpha1"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/topk_merge/extraversion-low-L_contrast-top-positive1pct-alpha1"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/topk_merge/extraversion-low-L_contrast-top-positive5pct-alpha1"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/topk_merge/extraversion-low-L_contrast-top-positive10pct-alpha1"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/topk_merge/extraversion-low-L_contrast-top-positive20pct-alpha1"
+#  - "/path/to/another/model-or-checkpoint"
+dataset_path: "/mnt/nvme2/models/amadeus/dataset_zoo/AIME25"
+output_path: "/mnt/nvme2/models/amadeus/cpvm_output/test/aime25"
+test_name: "zero-shot"
+
+# Each GPU holds one complete model replica; tensor parallelism stays at 1.
+use_vllm: true
+data_parallel_size: 2
+gpu_memory_utilization: 0.95
+dtype: "auto"
+
+# Every problem is evaluated on each active GPU; samples are split exactly.
+# With vLLM, batch_size is the per-GPU maximum number of questions kept in flight;
+# with Transformers, it remains the ordinary synchronous prompt batch size.
+device_map: "auto"
+batch_size: 15
+
+# Qwen report/model-card settings for instruct models.
+# 64 preserves the existing Mean@64 protocol; lower this for quick diagnostics.
+samples_per_question: 4
+temperature: 0.7
+top_p: 0.8
+top_k: 20
+min_p: 0.0
+# Base seed; each GPU receives a consecutive, non-overlapping sample-seed block.
+seed: 0
+max_length: 20000
+max_new_tokens: 16384
+save_responses: false

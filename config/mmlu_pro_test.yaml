@@ -1,0 +1,28 @@
+# 按列表顺序逐个评测，最后在 log 汇总模型得分表；继续加 - 路径即可。
+# 旧配置中的单个 model_path 仍可使用；同时填写时优先使用 model_paths。
+model_paths:
+  - "/mnt/nvme2/models/amadeus/cpvm_output/layer_module_merge/extraversion-high-modules-mlp-alpha1"
+#  - "/path/to/another/model-or-checkpoint"
+dataset_path: "/mnt/nvme2/models/amadeus/dataset_zoo/MMLU_Pro"
+output_path: "/mnt/nvme2/models/amadeus/cpvm_output/test/mmlu_pro"
+test_name: "official-cot-dp2-b256-ctx8k-out4k"
+
+# vLLM loads one complete model on each GPU and distributes requests between them.
+use_vllm: true
+data_parallel_size: 2
+gpu_memory_utilization: 0.9
+dtype: "auto"
+
+# Transformers fallback; lower batch_size manually when use_vllm is false.
+device_map: "auto"
+batch_size: 256
+
+# MMLU-Pro 5-shot CoT with a larger context and output budget.
+n_shot: 5
+max_length: 8192
+max_new_tokens: 4096
+seed: 12345
+
+categories: null
+max_samples: null
+save_responses: false

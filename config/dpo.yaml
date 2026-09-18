@@ -1,0 +1,104 @@
+# Model
+model_name_or_path: "/mnt/nvme2/models/amadeus/model_zoo/qwen3-4b-instruct-2507"
+finetune_type: "full"
+resume_wandb_run_id: 6b1pi8ep
+
+# DPO data
+data_path: "/mnt/nvme2/models/amadeus/dataset_zoo/big5_chat"
+val_ratio: 0.1
+filter_refusals: true
+preview_samples: 2
+
+# LoRA
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.0
+target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - gate_proj
+  - up_proj
+  - down_proj
+
+# Target personality; matches the current SFT configuration.
+
+trait: "Extraversion"
+level: "high"
+use_original_prompt: false
+dialogue_prompt: >-
+  You are Speaker Y in a fictional two-person dialogue.
+  The user message is Speaker X's latest utterance.
+  Write Speaker Y's next utterance.
+  Any names refer only to participants in the current dialogue,
+  not to your permanent identity.
+  Output only Speaker Y's utterance, without speaker labels,
+  narration, explanations, or meta-commentary.
+
+# Reproducibility
+seed: 42
+data_seed: 42
+do_train: true
+do_eval: true
+
+# DPO
+max_length: 1024
+beta: 0.1
+
+
+# Loss Configuration
+loss_type:
+  - "sigmoid"
+  - "sft"
+
+loss_weights:
+  - 1.0
+  - 0.1
+
+resume_from_checkpoint: "/mnt/nvme2/models/amadeus/cpvm_output/dpo/full/qwen3-4b-instruct-2507-dpo-full-big5chat-Extraversion-high-beta0.1-ep5/checkpoint-1000"
+
+
+
+disable_dropout: true
+
+# Two-GPU effective batch: 2 * 8 * 8 = 128 preference pairs.
+per_device_train_batch_size: 8
+per_device_eval_batch_size: 8
+gradient_accumulation_steps: 8
+
+# Optimization
+learning_rate: 1.0e-6
+weight_decay: 0.0
+
+# learning steps
+num_train_epochs: 5
+max_steps: 2000
+
+# learning rate scheduler type: linear, cosine, cosine_with_restarts, polynomial, constant, constant_with_warmup
+lr_scheduler_type: "linear"
+warmup_steps: 0
+max_grad_norm: 1.0
+
+# Logging/evaluation
+eval_on_start: true
+eval_strategy: "steps"
+eval_steps: 50
+logging_strategy: "steps"
+logging_steps: 10
+logging_dir: "/home/wbw/workspace/CPVM/logs/dpo"
+report_to: "wandb"
+
+# Saving/distributed execution
+save_strategy: "steps"
+save_steps: 200
+save_total_limit: 10
+output_dir: "/mnt/nvme2/models/amadeus/cpvm_output/dpo"
+bf16: true
+fp16: false
+tf32: true
+gradient_checkpointing: true
+ddp_backend: "nccl"
+ddp_find_unused_parameters: false
+dataloader_num_workers: 4
+deepspeed: "/home/wbw/workspace/CPVM/config/ds_zero2.json"

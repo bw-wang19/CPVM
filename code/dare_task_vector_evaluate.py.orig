@@ -1,0 +1,234 @@
+"""Evaluate the DaRE sweep and Task Vector model on TRAIT and GPQA."""
+
+from __future__ import annotations
+
+import csv
+import json
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+import yaml
+
+from CPVM.code.dare_task_vector_merge import (
+    dare_output_path,
+    task_vector_output_path,
+)
+from CPVM.code.utils.arguments import parse_args_yaml
+
+
+PERSONALITIES = [
+    "Extraversion",
+    "Agreeableness",
+    "Conscientiousness",
+    "Neuroticism",
+    "Openness",
+    "Machiavellianism",
+    "Narcissism",
+    "Psychopathy",
+]
+
+
+def load_yaml(path: str) -> dict:
+    """Load one existing benchmark configuration."""
+
+    with open(path, encoding="utf-8") as file:
+        return yaml.safe_load(file)
+
+
+def model_specs(config: dict) -> list[dict]:
+    """Describe every merged checkpoint in stable evaluation order."""
+
+    specs = []
+    for retain in config["retain_percentages"]:
+        specs.append(
+            {
+                "name": f"DaRE retain {retain:g}%",
+                "method": "DaRE",
+                "retain_percent": retain,
+                "path": dare_output_path(
+                    config["output_dir"], retain, config["seed"]
+                ),
+            }
+        )
+    alpha = float(config["task_vector_alpha"])
+    specs.append(
+        {
+            "name": f"Task Vector alpha={alpha:g}",
+            "method": "Task Vector",
+            "retain_percent": None,
+            "path": task_vector_output_path(config["output_dir"], alpha),
+        }
+    )
+    return specs
+
+
+def result_paths(config: dict, model_path: Path) -> dict[str, Path]:
+    """Return the TRAIT and GPQA report paths."""
+
+    root = Path(config["result_output_dir"])
+    name = model_path.name
+    test_name = config["test_name"]
+    return {
+        "trait": root / "trait" / f"trait-{name}.json",
+        "gpqa": root / "gpqa" / f"gpqa-diamond-{name}-{test_name}.json",
+    }
+
+
+def run_benchmark(
+    module: str,
+    base_config_path: str,
+    model_path: Path,
+    output_path: Path,
+    test_name: str,
+    expected_result: Path,
+) -> None:
+    """Run one existing test in an isolated process, unless already complete."""
+
+    if expected_result.exists():
+        print(f"Skipping existing result: {expected_result}", flush=True)
+        return
+
+    benchmark_config = load_yaml(base_config_path)
+    benchmark_config["model_path"] = str(model_path)
+    benchmark_config["output_path"] = str(output_path)
+    benchmark_config["test_name"] = test_name
+
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", encoding="utf-8"
+    ) as file:
+        yaml.safe_dump(benchmark_config, file, sort_keys=False, allow_unicode=True)
+        file.flush()
+        subprocess.run(
+            [sys.executable, "-m", module, "--config", file.name], check=True
+        )
+
+
+def collect_row(config: dict, spec: dict) -> dict | None:
+    """Read one model's finished TRAIT and GPQA reports into one row."""
+
+    paths = result_paths(config, spec["path"])
+    if not all(path.exists() for path in paths.values()):
+        return None
+
+    reports = {}
+    for key, path in paths.items():
+        with path.open(encoding="utf-8") as file:
+            reports[key] = json.load(file)
+
+    trait_record = next(
+        test
+        for test in reversed(reports["trait"]["tests"])
+        if test["test_name"] == config["test_name"]
+    )
+    row = {
+        "model": spec["name"],
+        "method": spec["method"],
+        "retain_percent": spec["retain_percent"],
+        "model_path": str(spec["path"]),
+    }
+    row.update(trait_record["scores"])
+    gpqa = reports["gpqa"]["summary"]
+    row.update(
+        {
+            "gpqa_avg10": 100 * gpqa["average_accuracy"],
+            "gpqa_parse_rate": 100 * gpqa["parse_rate"],
+            "gpqa_length_truncated": gpqa["length_truncated"],
+        }
+    )
+    return row
+
+
+def write_summary(config: dict, specs: list[dict]) -> None:
+    """Write CSV, JSON, and Markdown tables for all completed models."""
+
+    rows = [row for spec in specs if (row := collect_row(config, spec))]
+    if not rows:
+        return
+
+    root = Path(config["result_output_dir"])
+    root.mkdir(parents=True, exist_ok=True)
+    fields = [
+        "model",
+        "method",
+        "retain_percent",
+        *PERSONALITIES,
+        "gpqa_avg10",
+        "gpqa_parse_rate",
+        "gpqa_length_truncated",
+        "model_path",
+    ]
+    with (root / "summary.json").open("w", encoding="utf-8") as file:
+        json.dump(rows, file, ensure_ascii=False, indent=2)
+    with (root / "summary.csv").open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    columns = ["model", *PERSONALITIES, "MMLU-Pro", "GPQA avg@10"]
+    lines = [
+        "| " + " | ".join(columns) + " |",
+        "| " + " | ".join(["---"] + ["---:"] * (len(columns) - 1)) + " |",
+    ]
+    for row in rows:
+        values = [
+            row["model"],
+            *(f"{row[name]:.2f}" for name in PERSONALITIES),
+            f"{row['mmlu_pro_strict_accuracy']:.2f}",
+            f"{row['gpqa_avg10']:.2f}",
+        ]
+        lines.append("| " + " | ".join(values) + " |")
+    table = "\n".join(lines) + "\n"
+    (root / "summary.md").write_text(table, encoding="utf-8")
+    print("\n=== COMPLETED RESULTS ===\n" + table, flush=True)
+
+
+def run(config: dict) -> None:
+    """Evaluate each merge on TRAIT, MMLU-Pro, and GPQA, then summarize."""
+
+    specs = model_specs(config)
+    root = Path(config["result_output_dir"])
+    for index, spec in enumerate(specs, start=1):
+        model_path = spec["path"]
+        print(
+            f"\n{'=' * 72}\n[{index}/{len(specs)}] {spec['name']}\n"
+            f"{model_path}\n{'=' * 72}",
+            flush=True,
+        )
+        paths = result_paths(config, model_path)
+        run_benchmark(
+            "CPVM.code.test.trait_test",
+            config["trait_config_path"],
+            model_path,
+            root / "trait",
+            config["test_name"],
+            paths["trait"],
+        )
+        run_benchmark(
+            "CPVM.code.test.mmlu_pro_test",
+            config["mmlu_pro_config_path"],
+            model_path,
+            root / "mmlu_pro",
+            config["test_name"],
+            paths["mmlu_pro"],
+        )
+        run_benchmark(
+            "CPVM.code.test.gpqa_test",
+            config["gpqa_config_path"],
+            model_path,
+            root / "gpqa",
+            config["test_name"],
+            paths["gpqa"],
+        )
+        write_summary(config, specs)
+
+
+def main() -> None:
+    """Load the YAML interface and run the complete evaluation sweep."""
+
+    run(parse_args_yaml("Evaluate MergeLM DaRE and Task Vector models"))
+
+
+if __name__ == "__main__":
+    main()

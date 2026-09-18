@@ -1,0 +1,87 @@
+# 多 trait 合并：每个 trait 独立构造双极稀疏路径，再加权汇总相对共同 base 的更新。
+# d_r(t_r) = c_high(t_r)*d_r_high + c_low(t_r)*d_r_low
+# theta_merged = theta_base + sum_r weight_r*d_r(t_r)
+# weight 不自动归一化；同一坐标被多个 trait 选中时直接相加，不再做 top-k 或冲突过滤。
+# 以下两个 weight=0.5、t=0.5 只是示例，可独立修改；新增 trait 可继续追加列表项。
+base_model_path: "/mnt/nvme2/models/amadeus/model_zoo/qwen3-4b-instruct-2507"
+experiment_name: "extraversion-conscientiousness"
+output_dir: "/mnt/nvme2/models/amadeus/cpvm_output/multi_trait_merge"
+
+# 覆盖顺序：下面的共同 selection -> 每个 trait 的 selection。
+# 每个 trait 的 high/low 两端共用一个 Top-K mask，避免两个 k% 的并集扩大。
+# piecewise_linear 逐坐标合并两段 L_contrast 归因后选一次；连续路径直接用全路径归因。
+# 所有路径的 pole_overrides 只能分别覆盖 high/low 的 alpha。
+selection:
+  # contribution / delta_magnitude / finetuned_magnitude / random
+  # 非归因排序使用两个端点的共同分数，而不是逐极各选一次。
+  # 连续路径的 finetuned_magnitude 按两端 |theta| 的逐坐标最大值。
+  ranking_method: "contribution"
+  contribution_channel: "L_contrast"  # L_plus / L_star / L_contrast；piecewise 低段按统一 high 方向映射通道。
+  # positive 按 C 从大到小固定取 Top-K（可跨过 0）；absolute 按 |C|。
+  # channel 和 selection_mode 仅在 contribution 排序时生效。
+  selection_mode: "positive"
+  # [0, 100] 内任意数值，支持小数；分母为候选范围参数量。
+  k_percent: 5.0
+  # 与 topk_merge 一致：layers/modules 同时设置时取交集；null 或 [] 表示不限制。
+  # 例：layers: [0, 1, 2]；modules: ["self_attn.q_proj", "mlp"]。
+  # modules 多项取并集；指定范围且 k=100 时直接选择整个范围，无需排名/贡献文件。
+  layers: null
+  modules: null
+  seed: 0  # 仅 random 使用；每个 trait 用一个 seed 生成共同 mask。
+  alpha: 1.0  # 两端默认 delta 缩放；可在 pole_overrides 中分别覆盖。
+  # true 时再乘 1/q，q=实际选中参数量/候选范围参数量；k=0 时不可启用。
+  use_weight_rescale: false
+
+# 每个 trait 独立选择以下三种 path_method，可在同一配置中使用不同方法。
+# piecewise_linear：low -> base -> high，t=0 为 base。
+# endpoint_linear：low -> high 直线，t=0 为两端点均值，通常仍有更新。
+# quadratic：通过 low(t=-1)、base(t=0)、high(t=1) 的二次插值曲线。
+# t 是 [-1,1] 内的单个数值；weight 是任意有限实数，weight=0 跳过该 trait。
+# 路径系数为 0 的端点无需应用更新；只要任一端生效就执行一次共同选择。
+# sparsify:true 时每个 trait 的共同 mask 同时作用于两个 endpoint-base delta；
+# sparsify:false 使用完整两极 delta，selection/pole_overrides/贡献文件不参与构造端点。
+# 归因仍来自完整 SFT 路径，不代表合并后跨 trait 的联合归因。
+traits:
+  - trait: "Extraversion"
+    weight: 0.5
+    path_method: "quadratic"
+    t: 0.5
+    sparsify: true
+    plus_model_path: "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-high-ep10/checkpoint-1000"
+    star_model_path: "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-low-ep5/checkpoint-800"
+    # 先用 bipolar_path_integral.yaml 生成对应几何路径的 common 全路径贡献文件。
+    # 切换 path_method 必须同步切换贡献目录；新曲线路径不能复用旧直线归因。
+    contribution_dirs:
+      common: "/mnt/nvme2/models/amadeus/cpvm_output/path_integral/quadratic/extraversion-high-low/common"
+    selection: {}  # 可覆盖共同 selection 中任意项，例如 k_percent: 10.0。
+    pole_overrides:
+      high:
+        alpha: 1.0
+      low:
+        alpha: 1.0
+
+  - trait: "Conscientiousness"
+    weight: 0.5
+    path_method: "quadratic"
+    t: 0.5
+    sparsify: true
+    plus_model_path: "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Conscientiousness-high-ep5/checkpoint-1000"
+    star_model_path: "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Conscientiousness-low-ep5/checkpoint-1000"
+    # 这些是预期生成目录，不代表贡献文件已存在。
+    # 在 bipolar_path_integral.yaml 中换成此 trait 的两端模型、trait: Conscientiousness、
+    # output_name: conscientiousness-high-low，并保持 path_method: quadratic，先运行归因。
+    contribution_dirs:
+      common: "/mnt/nvme2/models/amadeus/cpvm_output/path_integral/quadratic/conscientiousness-high-low/common"
+    selection: {}
+    pole_overrides:
+      high:
+        alpha: 1.0
+      low:
+        alpha: 1.0
+
+# 单次配置输出一个完整 checkpoint：output_dir/<experiment_name>-<配置哈希>/。
+# 同目录 multi_trait_merge.json 保存完整配方及每个 trait 的共同选择报告。
+# 全程 CPU，逐 trait 汇总 FP32 delta，所有 selection 始终相对同一未修改的 base。
+merge_dtype: "auto"  # auto / bfloat16 / float16 / float32
+chunk_numel: 5000000
+max_shard_size: "5GB"

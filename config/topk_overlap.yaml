@@ -1,0 +1,79 @@
+# Compare exact Top-k parameter sets across N models.
+# Run:
+#   bash /home/wbw/workspace/CPVM/scripts/topk_overlap.sh
+#
+# A shared base is mathematically required by delta_magnitude. Pure contribution
+# comparisons do not load it. The other model-based methods use it to reproduce
+# the same parameter universe, dtype, tied-weight handling, and scope as topk_merge.
+base_model_path: "/mnt/nvme2/models/amadeus/model_zoo/qwen3-4b-instruct-2507"
+
+# Every label must be unique. Supply only the inputs required by the configured
+# strategies, although keeping both paths here makes one model reusable by all.
+# seed is mandatory for random and is deliberately explicit per model: equal
+# seeds on equal parameter structures produce identical random masks.
+models:
+  - label: "extraversion-high"
+    finetuned_model_path: "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-high-ep10/checkpoint-1000"
+    contribution_dir: "/mnt/nvme2/models/amadeus/cpvm_output/path_integral/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-high-ep10-checkpoint-1000"
+    seed: 0
+  - label: "extraversion-low"
+    finetuned_model_path: "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-low-ep5/checkpoint-800"
+    contribution_dir: "/mnt/nvme2/models/amadeus/cpvm_output/path_integral/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-low-ep5-checkpoint-800"
+    seed: 1
+
+# Each strategy has its own complete selection configuration and produces an
+# independent N x N result for every requested k. k_percents accepts arbitrary
+# integers or decimals in [1, 100], for example [1, 2.5, 7, 33.3, 100].
+strategies:
+  - name: "L_contrast-positive"
+    ranking_method: "contribution"
+    contribution_channel: "L_contrast"  # L_plus, L_star, or L_contrast
+    selection_mode: "positive"          # positive: C 降序；absolute: |C| 降序
+    layers: null
+    modules: null
+    merge_dtype: "auto"
+    k_percents: [1, 5, 10, 20]
+
+  # Additional strategy examples:
+  #
+  # - name: "L_plus-absolute"
+  #   ranking_method: "contribution"
+  #   contribution_channel: "L_plus"
+  #   selection_mode: "absolute"
+  #   layers: null
+  #   modules: null
+  #   merge_dtype: "auto"
+  #   k_percents: [1, 2.5, 5]
+  #
+  # - name: "delta-magnitude"
+  #   ranking_method: "delta_magnitude"
+  #   layers: null
+  #   modules: null
+  #   merge_dtype: "auto"
+  #   k_percents: [1, 5, 10]
+  #
+  # - name: "finetuned-magnitude-mlp"
+  #   ranking_method: "finetuned_magnitude"
+  #   layers: null
+  #   modules: ["mlp"]
+  #   merge_dtype: "auto"
+  #   k_percents: [1, 5, 10]
+  #
+  # - name: "random-baseline"
+  #   ranking_method: "random"
+  #   layers: null
+  #   modules: null
+  #   merge_dtype: "auto"
+  #   k_percents: [1, 5, 10]
+
+chunk_numel: 5000000
+output_dir: "/mnt/nvme2/models/amadeus/cpvm_output/path_integral/topk_overlap"
+
+# Every strategy/k directory contains:
+#   intersection_count.csv
+#   random_expected_intersection.csv
+#   overlap_coefficient.csv
+#   jaccard.csv
+#   overlap_lift.csv
+#   chance_adjusted_overlap.csv
+# Normalized overlap metrics also receive annotated PNG and SVG heatmaps.

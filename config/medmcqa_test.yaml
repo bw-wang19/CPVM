@@ -1,0 +1,55 @@
+# Models are evaluated strictly in list order. Add or remove paths as needed.
+model_paths:
+  - "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-medmcqa-explanation-boxed-ep2/checkpoint-2000"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-medmcqa-explanation-boxed-ep2/checkpoint-2200"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-medmcqa-explanation-boxed-ep2/checkpoint-2400"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-medmcqa-explanation-boxed-ep2/checkpoint-2600"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-medmcqa-explanation-boxed-ep2/checkpoint-2800"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-medmcqa-explanation-boxed-ep2/checkpoint-3000"
+
+
+
+
+  # - "/path/to/another/model-or-checkpoint"
+
+dataset_path: "/mnt/nvme2/models/amadeus/dataset_zoo/medmcqa"
+output_path: "/mnt/nvme2/models/amadeus/cpvm_output/test/medmcqa"
+test_name: "validation-generative-v1"
+
+# The public test split contains cop=-1 and cannot be scored locally. lm-eval
+# likewise evaluates MedMCQA on the labelled validation split (4,183 rows).
+split: "validation"
+expected_num_questions: 4183
+
+# Protocol: 0-shot, lm-eval-style Question/Choices/A-D/Answer layout, native
+# chat template, and exact match on the final boxed A-D letter. This is a
+# generation protocol; lm-eval's own acc/acc_norm use choice log-likelihoods.
+# Canonical deterministic setting: Avg@1 with greedy decoding. For Avg@N,
+# set samples_per_question: N and temperature > 0. Test@N is also reported.
+samples_per_question: 1
+temperature: 0.0
+top_p: 1.0
+top_k: -1
+min_p: 0.0
+presence_penalty: 0.0
+repetition_penalty: 1.0
+sampling_seed: 0
+
+# Two one-GPU AsyncLLMEngine replicas pull individual (question, sample) tasks
+# from one queue. Seeds are unique and independent of GPU scheduling.
+data_parallel_size: 2
+work_size: 16
+gpu_memory_utilization: 0.95
+dtype: "auto"
+max_new_tokens: 2048
+max_model_len: 4096
+stop:
+  - "</s>"
+  - "<|im_end|>"
+
+# Abort a model cleanly if workers stop returning samples or fail to shut down.
+inactivity_timeout_seconds: 900
+worker_shutdown_timeout_seconds: 120
+
+# The benchmark is public. Enable this when raw-generation auditing is needed.
+save_responses: false

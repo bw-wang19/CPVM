@@ -1,0 +1,312 @@
+"""Qwen-compatible GPQA-Diamond avg@10 evaluation with vLLM data parallelism."""
+
+import csv
+from collections import defaultdict
+import json
+import multiprocessing as mp
+import os
+from pathlib import Path
+import queue
+import random
+import re
+import traceback
+
+from tqdm.auto import tqdm
+from transformers import AutoTokenizer
+
+from CPVM.code.utils.arguments import parse_args_yaml
+from CPVM.code.utils.batch_evaluation import run_models
+
+
+LETTERS = "ABCD"
+BOXED_ANSWER = re.compile(r"\\boxed\s*\{\s*([A-Da-d])\s*\}")
+PROMPT = """{question}
+Answer Choices: (A) {choice_a} (B) {choice_b} (C) {choice_c} (D) {choice_d}
+On the last line of your response, place your final answer letter within \\boxed{{}} (e.g., \\boxed{{A}}), ensuring only the letter is inside."""
+
+
+def load_questions(dataset_path, seed):
+    """Load GPQA-Diamond and apply the GPQA repository's seeded choice shuffle."""
+
+    csv_path = Path(dataset_path) / "gpqa_diamond.csv"
+    with csv_path.open(encoding="utf-8-sig", newline="") as file:
+        rows = list(csv.DictReader(file))
+
+    rng = random.Random(seed)
+    questions = []
+    for row in rows:
+        choices = [
+            row["Incorrect Answer 1"],
+            row["Incorrect Answer 2"],
+            row["Incorrect Answer 3"],
+            row["Correct Answer"],
+        ]
+        rng.shuffle(choices)
+        questions.append(
+            {
+                "record_id": row["Record ID"],
+                "domain": row["High-level domain"],
+                "question": row["Question"].strip(),
+                "choices": [choice.strip() for choice in choices],
+                "answer": LETTERS[choices.index(row["Correct Answer"])],
+            }
+        )
+    return questions
+
+
+def build_prompts(questions, tokenizer):
+    """Format the Qwen GPQA prompt and apply the model's native chat template."""
+
+    prompts = []
+    for row in questions:
+        content = PROMPT.format(
+            question=row["question"],
+            choice_a=row["choices"][0],
+            choice_b=row["choices"][1],
+            choice_c=row["choices"][2],
+            choice_d=row["choices"][3],
+        )
+        prompts.append(
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": content}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        )
+    return prompts
+
+
+def extract_answer(text):
+    """Return the final boxed A--D letter, or None when the format is invalid."""
+
+    matches = BOXED_ANSWER.findall(text)
+    return matches[-1].upper() if matches else None
+
+
+def vllm_worker(rank, devices, task_queue, result_queue, config):
+    """Run work units on one complete single-GPU vLLM model replica."""
+
+    try:
+        os.environ["CUDA_VISIBLE_DEVICES"] = devices[rank]
+        from vllm import LLM, SamplingParams
+
+        print(f"GPQA worker {rank}: loading model on GPU {devices[rank]}", flush=True)
+        model = LLM(
+            model=config["model_path"],
+            trust_remote_code=True,
+            dtype=config["dtype"],
+            tensor_parallel_size=1,
+            gpu_memory_utilization=config["gpu_memory_utilization"],
+            max_model_len=config["max_model_len"],
+            seed=config["sampling_seed"],
+        )
+        sampling = SamplingParams(
+            n=config["samples_per_question"],
+            temperature=config["temperature"],
+            top_p=config["top_p"],
+            top_k=config["top_k"],
+            min_p=config["min_p"],
+            presence_penalty=config["presence_penalty"],
+            repetition_penalty=config["repetition_penalty"],
+            max_tokens=config["max_new_tokens"],
+            seed=config["sampling_seed"],
+        )
+        print(f"GPQA worker {rank}: ready", flush=True)
+
+        while True:
+            task = task_queue.get()
+            if task is None:
+                break
+            indices, prompts = task
+            outputs = model.generate(prompts, sampling, use_tqdm=False)
+            batches = []
+            for output in outputs:
+                samples = []
+                for sample in output.outputs:
+                    item = {
+                        "prediction": extract_answer(sample.text),
+                        "finish_reason": sample.finish_reason,
+                        "output_tokens": len(sample.token_ids),
+                    }
+                    if config["save_responses"]:
+                        item["response"] = sample.text
+                    samples.append(item)
+                batches.append(samples)
+            result_queue.put(("result", indices, batches))
+    except Exception:
+        result_queue.put(("error", rank, traceback.format_exc()))
+
+
+def generate_vllm(prompts, config):
+    """Dynamically distribute prompt work units over independent GPU replicas."""
+
+    size = config["data_parallel_size"]
+    default_devices = ",".join(str(rank) for rank in range(size))
+    devices = os.environ.get("CUDA_VISIBLE_DEVICES", default_devices).split(",")
+    context = mp.get_context("spawn")
+    task_queue = context.Queue()
+    result_queue = context.Queue()
+
+    work_size = config["work_size"]
+    tasks = []
+    for start in range(0, len(prompts), work_size):
+        indices = list(range(start, min(start + work_size, len(prompts))))
+        tasks.append((indices, [prompts[index] for index in indices]))
+        task_queue.put(tasks[-1])
+    for _ in range(size):
+        task_queue.put(None)
+
+    processes = [
+        context.Process(
+            target=vllm_worker,
+            args=(rank, devices, task_queue, result_queue, config),
+        )
+        for rank in range(size)
+    ]
+    for process in processes:
+        process.start()
+
+    responses = [None] * len(prompts)
+    completed_tasks = 0
+    with tqdm(total=len(prompts), desc="GPQA-Diamond avg@10", unit="question") as bar:
+        while completed_tasks < len(tasks):
+            try:
+                message = result_queue.get(timeout=30)
+            except queue.Empty:
+                failed = [process for process in processes if process.exitcode]
+                if failed:
+                    raise RuntimeError("A vLLM data-parallel worker exited unexpectedly")
+                continue
+
+            if message[0] == "error":
+                for process in processes:
+                    if process.is_alive():
+                        process.terminate()
+                raise RuntimeError(f"GPQA worker {message[1]} failed:\n{message[2]}")
+
+            _, indices, batches = message
+            for index, samples in zip(indices, batches):
+                responses[index] = samples
+            completed_tasks += 1
+            bar.update(len(indices))
+
+    for process in processes:
+        process.join()
+    if any(process.exitcode for process in processes):
+        raise RuntimeError("A vLLM data-parallel worker failed")
+    return responses
+
+
+def summarize(results, samples_per_question):
+    """Calculate Qwen's average sample accuracy and useful audit statistics."""
+
+    samples = [sample for row in results for sample in row["samples"]]
+    grouped = defaultdict(list)
+    for row in results:
+        grouped[row["domain"]].extend(row["samples"])
+
+    correct = sum(sample["correct"] for sample in samples)
+    return {
+        "num_questions": len(results),
+        "samples_per_question": samples_per_question,
+        "total_samples": len(samples),
+        "correct_samples": correct,
+        "average_accuracy": correct / len(samples),
+        "parse_rate": sum(sample["prediction"] is not None for sample in samples)
+        / len(samples),
+        "length_truncated": sum(
+            sample["finish_reason"] == "length" for sample in samples
+        ),
+        "sample_index_accuracy": [
+            sum(row["samples"][index]["correct"] for row in results) / len(results)
+            for index in range(samples_per_question)
+        ],
+        "domain_accuracy": {
+            domain: sum(sample["correct"] for sample in domain_samples)
+            / len(domain_samples)
+            for domain, domain_samples in sorted(grouped.items())
+        },
+    }
+
+
+def result_path(config):
+    """Build the JSON report path from model and test names."""
+
+    source = Path(config["model_path"])
+    model_name = source.name
+    if model_name.startswith("checkpoint-"):
+        model_name = f"{source.parent.name}-{model_name}"
+    return Path(config["output_path"]) / (
+        f"gpqa-diamond-{model_name}-{config['test_name']}.json"
+    )
+
+
+def run(config):
+    """Run the complete official-style GPQA-Diamond avg@10 evaluation."""
+
+    questions = load_questions(config["dataset_path"], config["choice_seed"])
+    tokenizer = AutoTokenizer.from_pretrained(
+        config["model_path"], trust_remote_code=True, use_fast=False
+    )
+    prompts = build_prompts(questions, tokenizer)
+    prompt_lengths = [
+        len(tokenizer.encode(prompt, add_special_tokens=False)) for prompt in prompts
+    ]
+    max_prompt_tokens = max(prompt_lengths)
+    if max_prompt_tokens + config["max_new_tokens"] > config["max_model_len"]:
+        raise ValueError("max_model_len is too small for the longest prompt and output")
+
+    print(
+        f"GPQA-Diamond: {len(questions)} questions x "
+        f"{config['samples_per_question']} samples; max prompt={max_prompt_tokens} tokens"
+    )
+    responses = generate_vllm(prompts, config)
+
+    results = []
+    for question, samples in zip(questions, responses):
+        for sample in samples:
+            sample["correct"] = sample["prediction"] == question["answer"]
+        results.append(
+            {
+                "record_id": question["record_id"],
+                "domain": question["domain"],
+                "answer": question["answer"],
+                "correct_samples": sum(sample["correct"] for sample in samples),
+                "samples": samples,
+            }
+        )
+
+    summary = summarize(results, config["samples_per_question"])
+    report = {
+        "benchmark": "GPQA-Diamond",
+        "metric": "average_accuracy@10",
+        "model_path": config["model_path"],
+        "settings": config,
+        "summary": summary,
+        "predictions": results,
+    }
+    path = result_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(report, file, ensure_ascii=False, indent=2)
+
+    print(
+        f"GPQA-Diamond avg@{config['samples_per_question']}: "
+        f"{summary['correct_samples']}/{summary['total_samples']} = "
+        f"{summary['average_accuracy']:.2%}"
+    )
+    print(f"Parse rate: {summary['parse_rate']:.2%}")
+    print(f"Length-truncated samples: {summary['length_truncated']}")
+    print(f"Saved to: {path}")
+    return report
+
+
+def main():
+    """Load YAML and start the GPQA evaluation."""
+
+    config = parse_args_yaml("GPQA-Diamond official-style avg@10 evaluation")
+    run_models(config, run, "GPQA-Diamond")
+
+
+if __name__ == "__main__":
+    main()

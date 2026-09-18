@@ -1,0 +1,82 @@
+# --- ModelArguments ---
+model_name_or_path: "/mnt/nvme2/models/amadeus/model_zoo/qwen3-4b-instruct-2507"  # 替换为实际路径
+finetune_type: "full"  # Fine-tuning type: "lora" or "full"
+
+# --- DataArguments ---
+data_path: "/mnt/nvme2/models/amadeus/dataset_zoo/big5_chat"
+max_length: 1024
+val_ratio: 0.1
+filter_refusals: true
+preview_samples: 2
+# --- LoraArguments ---
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+# 针对 Qwen/Llama 的常见全量模块，根据具体模型调整
+target_modules: 
+  - "q_proj"
+  - "k_proj"
+  - "v_proj"
+  - "o_proj"
+  - "gate_proj"
+  - "up_proj"
+  - "down_proj"
+
+# --- Big5ChatArguments ---
+trait: "Agreeableness"  # 可选：Agreeableness, Conscientiousness, Extraversion, Neuroticism, Openness
+level: "high"  # 可选：high, low
+use_original_prompt: false
+dialogue_prompt: >-
+  You are Speaker Y in a fictional two-person dialogue.
+  The user message is Speaker X's latest utterance.
+  Write Speaker Y's next utterance.
+  Any names refer only to participants in the current dialogue,
+  not to your permanent identity.
+  Output only Speaker Y's utterance, without speaker labels,
+  narration, explanations, or meta-commentary.
+
+
+# --- TrainingArguments (原生 Trainer 参数) ---
+# 这些参数会自动被 TrainingArguments 识别
+seed: 42
+data_seed: 42
+do_train: true
+do_eval: true
+do_predict: false
+eval_strategy: "steps"
+eval_steps: 20
+per_device_train_batch_size: 8
+per_device_eval_batch_size: 8
+gradient_accumulation_steps: 4
+
+learning_rate: 1.0e-5
+weight_decay: 0
+adam_beta1: 0.9
+adam_beta2: 0.999
+num_train_epochs: 1
+max_steps: 1000
+warmup_steps: 0
+
+logging_dir: "/home/wbw/workspace/CPVM/logs/sft"
+logging_steps: 10
+
+
+save_strategy: "steps"
+save_steps: 200
+resume_from_checkpoint: null
+save_total_limit: 1
+
+bf16: true                # 开启 BF16
+# fp16: true
+tf32: true                # 如果是 Ampere 架构(3090/4090/A100) 建议开启
+# sharded_ddp: false        # "simple" "zero_dp_2" "zero_dp_3" "offload"
+ddp_backend: "nccl"       # nccl gloo
+gradient_checkpointing: true  # 梯度检查点，看一下显存够不够用，够用就设置为false
+report_to: "wandb"  # "wandb" "tensorboard" "comet_ml" "mlflow" "neptune" "clearml" "wandb" "polyaxon" "deeplog" "sacred" "mlflow" "checkpoint" "none"
+dataloader_num_workers: 32   # 数据加载的子进程数量（用于PyTorch  ). 0表示数据由主进程加载
+output_dir: "/mnt/nvme2/models/amadeus/cpvm_output/sft"  # 模型输出路径
+# DDP 关键参数：防止 LoRA 报错
+ddp_find_unused_parameters: false
+
+# Deepspeed配置
+deepspeed: "/home/wbw/workspace/CPVM/config/ds_zero2.json"

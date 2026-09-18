@@ -1,0 +1,40 @@
+import random
+
+from CPVM.code.test.gpqa_test import extract_answer, summarize
+
+
+def test_extract_answer_uses_the_final_strict_boxed_letter():
+    assert extract_answer(r"first \boxed{B}, finally \boxed{ c }") == "C"
+    assert extract_answer("The answer is C") is None
+    assert extract_answer(r"\boxed{C because reasons}") is None
+
+
+def test_gpqa_choice_shuffle_matches_the_public_seeded_rule():
+    choices = ["wrong-1", "wrong-2", "wrong-3", "correct"]
+    random.Random(0).shuffle(choices)
+    assert choices == ["wrong-3", "wrong-1", "wrong-2", "correct"]
+
+
+def test_summary_averages_every_sample_without_voting():
+    results = [
+        {
+            "domain": "Physics",
+            "samples": [
+                {"prediction": "A", "correct": True, "finish_reason": "stop"},
+                {"prediction": None, "correct": False, "finish_reason": "length"},
+            ],
+        },
+        {
+            "domain": "Chemistry",
+            "samples": [
+                {"prediction": "B", "correct": False, "finish_reason": "stop"},
+                {"prediction": "C", "correct": True, "finish_reason": "stop"},
+            ],
+        },
+    ]
+    summary = summarize(results, samples_per_question=2)
+    assert summary["total_samples"] == 4
+    assert summary["correct_samples"] == 2
+    assert summary["average_accuracy"] == 0.5
+    assert summary["parse_rate"] == 0.75
+    assert summary["length_truncated"] == 1

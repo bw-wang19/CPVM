@@ -1,0 +1,36 @@
+# 基础模型、已经 merge 的完整模型，或全参微调的 checkpoint-* 目录。
+# checkpoint-* 会以“父训练目录名-checkpoint-N”作为结果中的模型名。
+model_path: "/mnt/nvme2/models/amadeus/model_zoo/qwen3-4b-instruct-2507"
+# LoRA adapter/checkpoint 目录。null 时直接测试 model_path 指向的完整模型。
+adapter_path: null
+json_path: "/mnt/nvme2/models/amadeus/dataset_zoo/BFI"
+output_path: "/mnt/nvme2/models/amadeus/cpvm_output/test/bfi"
+
+gpu_memory_utilization: 0.9
+temperature: 0.0
+tensor_parallel_size: 1
+use_vllm: False
+
+
+reverse: False
+few_shot: True
+all_in_one: False
+question_ids: null
+
+# --- 其他参数 ---
+system_prompt : >-
+  Here are a number of characteristics that may or may not apply to you.
+  For example, do you agree that you are someone who likes to spend time with others?
+  Please select a number from 1~5 for each statement to indicate the extent to which you agree or disagree with that statement.
+  The following are the scoring criteria:
+  1. Disagree strongly
+  2. Disagree a little
+  3. Neither agree nor disagree
+  4. Agree a little
+  5. Agree strongly
+
+# trait_prompt: You are a person with the following Big Five personality trait -> high neuroticism.
+trait_prompt: null
+
+# bfi test version
+question_version: 2  # 1: BFI-44, 2: BFI-60, 0: both

@@ -1,0 +1,61 @@
+# 基础模型、已经 merge 的完整模型，或全参微调的 checkpoint-* 目录。
+# checkpoint-* 会以“父训练目录名-checkpoint-N”作为结果中的模型名。
+# 按列表顺序逐个评测，最后在 log 汇总模型得分表；继续加 - 路径即可。
+# 旧配置中的单个 model_path 仍可使用；同时填写时优先使用 model_paths。
+model_paths:
+  - "/mnt/nvme2/models/amadeus/cpvm_output/topk_merge/extraversion-low-random-keep-5pct-alpha-1-rescaled-seed0"
+#  - "/path/to/another/model-or-checkpoint"
+# LoRA adapter/checkpoint 目录。null 时直接测试列表中的模型；填写时对每个模型使用同一个 adapter。
+# adapter_path: "/mnt/nvme2/models/amadeus/cpvm_output/sft/adapters/qwen3-4b-instruct-2507-sft-lora-big5chat-Extraversion-high-ep10/checkpoint-1000"
+dataset_path: "/mnt/nvme2/models/amadeus/dataset_zoo/TRAIT"
+output_path: "/mnt/nvme2/models/amadeus/cpvm_output/test/trait"
+
+# 可选的本次测试名称，会随测试记录一起保存；null 时仅使用自动 test_id。
+test_name: "Conscientiousness-high-ckpt-sweep-20260908"
+
+# false 时只使用 Transformers，不会导入 vLLM。
+use_vllm: false
+
+# Transformers 和 vLLM 都会使用 dtype；可填 auto、bfloat16、float16、float32。
+dtype: auto
+
+# 仅 Transformers 使用。可填 auto、cpu、cuda:0，或 null。
+device_map: auto
+
+# 仅 Transformers 使用。每张可见 GPU 常驻一份完整模型，并发处理 batch。
+data_parallel_size: 2
+
+# 仅 vLLM 使用。
+gpu_memory_utilization: 0.9
+tensor_parallel_size: 1
+
+# 1/3 使用 A、B、C、D；2 使用 1、2、3、4。
+prompt_type: 1
+
+# 四个客观题分别示范 A/B/C/D，示例中不含人格信息。
+few_shot: true
+enable_thinking: false
+system_prompt: >-
+  You are completing a forced-choice task.
+  For each question, reply with exactly one option label and nothing else.
+  Do not repeat "Answer:" or provide an explanation.
+
+# 默认不告诉模型目标人格。只有做 prompt positive control 时才填写它。
+# trait_prompt: >-
+#   You are an unconscientious person.
+trait_prompt: null
+
+# null 会测试 TRAIT 数据集中的全部八种人格；也可显式指定人格列表。
+personalities: null
+#   - Agreeableness
+#   - Conscientiousness
+#   - Extraversion
+#   - Neuroticism
+#   - Openness
+
+
+max_samples: null
+
+# 每题会同时构造 normal/reversed 两条 prompt，所以实际前向 batch 是这里的两倍。
+batch_size: 64
+max_length: 1024

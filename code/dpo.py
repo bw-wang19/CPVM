@@ -1,0 +1,230 @@
+#!/usr/bin/env python
+"""
+LoRA DPO training for BIG5-CHAT.
+
+The script intentionally keeps the DPO path independent from the existing SFT
+pipeline:
+
+1. Split all examples by ``original_index`` with a fixed seed.
+2. Pair high/low responses from the same ``(original_index, trait)``.
+3. Give TRL an un-tokenized conversational preference dataset.
+4. Let ``DPOTrainer`` attach a fresh LoRA adapter to the instruct base model.
+
+Example:
+    cd /home/wbw/workspace
+    torchrun --nproc_per_node=2 --module CPVM.code.dpo CPVM/config/dpo.yaml
+
+This implementation targets TRL 1.9.1. In particular, it uses
+``processing_class=tokenizer`` and the current ``DPOConfig.max_length`` field.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import random
+import re
+import sys
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import torch
+from datasets import Dataset, load_dataset
+from peft import LoraConfig, TaskType
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    HfArgumentParser,
+    set_seed,
+)
+
+
+try:
+    from trl import DPOConfig, DPOTrainer
+except ImportError as exc:
+    raise ImportError(
+        "TRL is required for dpo.py. Install the pinned version with "
+        '`python -m pip install "trl[peft]==1.9.1"`.'
+    ) from exc
+
+from CPVM.code.utils.arguments import *
+from CPVM.code.utils.process import Big5Chat
+from CPVM.code.utils.model import *
+
+try:
+    logger = logging.getLogger(__name__)
+except:
+    logger = logging.get_logger(__name__)
+
+
+def main() -> None:
+    # HfArgumentParser 可以同时读取命令行参数和 yaml/json 文件
+    parser = HfArgumentParser(
+            (
+                ModelArguments,
+                DPODataArguments,
+                LoraArguments,
+                DPOConfig,
+                Big5ChatArguments,
+            )
+        ) 
+    # 如果命令行传入了 .yaml/.json 文件，直接解析
+    if len(sys.argv) == 2 and sys.argv[1].endswith((".json", ".yaml", ".yml")):
+        model_args, data_args, lora_args, training_args, big5chat_args = parser.parse_yaml_file(yaml_file=os.path.abspath(sys.argv[1]))
+    else:
+        # 否则尝试解析命令行参数
+        cc, data_args, lora_args, training_args, big5chat_args = parser.parse_args_into_dataclasses() 
+    
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+        level=logging.INFO if training_args.local_rank in (-1, 0) else logging.WARNING,
+    )
+    
+    if training_args.resume_from_checkpoint is not None:
+        logger.info(
+            "Resuming DPO training from checkpoint: %s", training_args.resume_from_checkpoint
+        )
+        os.environ["WANDB_RESUME"] = "must"
+        os.environ["WANDB_RUN_ID"] = model_args.resume_wandb_run_id
+    
+    if big5chat_args.trait is None or big5chat_args.level is None:
+            raise ValueError("Both 'trait' and 'level' must be specified in Big5ChatArguments.")
+    else:
+        trait_filter = {
+            'trait': big5chat_args.trait,
+            'level': big5chat_args.level     
+        }
+        print(f"Filtering dataset for trait: {trait_filter}")  
+
+    split_seed = (
+        training_args.data_seed
+        if training_args.data_seed is not None
+        else training_args.seed
+    )
+    set_seed(training_args.seed)
+    
+    model_name = Path(model_args.model_name_or_path.rstrip("/")).name
+    run_name = f"{model_name}-dpo-{model_args.finetune_type}-big5chat-{trait_filter['trait']}-{trait_filter['level']}-beta{training_args.beta:g}-ep{training_args.num_train_epochs}"
+    training_args.run_name = run_name
+    output_subdir = "adapters" if model_args.finetune_type == "lora" else "full"
+    training_args.output_dir = os.path.join(
+        training_args.output_dir,
+        output_subdir,
+        run_name,
+    )
+    
+    logger.info(
+        "DPO target=%s-%s, seed=%d, data_seed=%d, output_dir=%s",
+        trait_filter['trait'],
+        trait_filter['level'],
+        training_args.seed,
+        split_seed,
+        training_args.output_dir,
+    )
+    
+    '''
+    -------------
+    Processing Dataset
+    -------------
+    '''
+    
+    dataset = Big5Chat(data_args.data_path)
+    
+    with training_args.main_process_first(desc="Building BIG5-CHAT DPO pairs"):
+        # 1. 对原始数据按照original_index进行划分，保证训练集和验证集的分布一致
+        dataset_split = Big5Chat.split_by_original_index(
+            dataset,
+            val_size=data_args.val_ratio,
+            seed=split_seed,
+        )
+        
+        # 2. train/val 使用相同的 trait-level 过滤规则
+        dataset_filtered = dataset_split.filter(
+            Big5Chat.filter_func,
+            num_proc=32,
+            fn_kwargs={
+                'trait_filter': {'trait': big5chat_args.trait}, 
+                'big5chat_args': big5chat_args,
+            }                     
+        )
+        
+        train_dataset = Big5Chat.build_dpo_dataset(
+            dataset=dataset_filtered["train"],
+            chosen_level=trait_filter['level'],
+            big5chat_args=big5chat_args,
+            filter_refusals=data_args.filter_refusals,
+        )
+        
+        val_dataset = Big5Chat.build_dpo_dataset(
+            dataset=dataset_filtered["val"],
+            chosen_level=trait_filter['level'],
+            big5chat_args=big5chat_args,
+            filter_refusals=data_args.filter_refusals,
+        )
+        logger.info(
+            "DPO dataset sizes: train=%d from filtered original dataset(totally %d), val=%d from filtered validation dataset(totally %d)",
+            len(train_dataset),
+            len(dataset_filtered["train"]),
+            len(val_dataset),
+            len(dataset_filtered["val"]),
+        )
+        
+    '''
+    -------------
+    Loading Base Model and Tokenizer
+    -------------
+    '''
+    
+    logger.info("Loading base model from %s", model_args.model_name_or_path)
+    model, tokenizer = load_model_tokenizer(model_args, lora_args)
+
+    if training_args.disable_dropout and lora_args.lora_dropout:
+        logger.warning(
+            "DPOConfig.disable_dropout=true, so TRL will disable the configured "
+            "LoRA dropout (lora_dropout=%s) during DPO training. For a controlled "
+            "SFT/DPO comparison, use lora_dropout: 0.0 in both runs.",
+            lora_args.lora_dropout,
+        )
+        
+    trainer = DPOTrainer(
+        model=model,
+        ref_model=None,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset if training_args.do_eval else None,
+        processing_class=tokenizer,
+    )
+
+    if hasattr(trainer.model, "print_trainable_parameters"):
+        trainer.model.print_trainable_parameters()
+
+    if training_args.do_train:
+        train_result = trainer.train(
+            resume_from_checkpoint=training_args.resume_from_checkpoint
+        )
+        train_metrics = train_result.metrics
+        train_metrics["train_pairs"] = len(train_dataset)
+        trainer.log_metrics("train", train_metrics)
+        trainer.save_metrics("train", train_metrics)
+        trainer.save_state()
+        trainer.save_model()
+
+        if training_args.should_save:
+            tokenizer.save_pretrained(training_args.output_dir)
+
+    if training_args.do_eval:
+        eval_metrics = trainer.evaluate()
+        eval_metrics["eval_pairs"] = len(val_dataset)
+        trainer.log_metrics("eval", eval_metrics)
+        trainer.save_metrics("eval", eval_metrics)
+
+    logger.info("DPO run finished. Output: %s", training_args.output_dir)
+
+
+if __name__ == "__main__":
+    main()

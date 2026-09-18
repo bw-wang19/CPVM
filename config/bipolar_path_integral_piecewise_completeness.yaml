@@ -1,0 +1,72 @@
+# Completeness-only audit for existing piecewise-linear attribution files.
+# 两个完整 SFT endpoint 来自同一个 base；plus 固定 high，star 固定 low。
+base_model_path: "/mnt/nvme2/models/amadeus/model_zoo/qwen3-4b-instruct-2507"
+plus_model_path: "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-high-ep10/checkpoint-1000"
+star_model_path: "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-low-ep5/checkpoint-800"
+
+# 三种独立的路径几何；切换此项会写入相应的一级子目录。
+# piecewise_linear: low(-1) -> base(0) -> high(+1)，两段分别归因，可复用旧单端点归因。
+# endpoint_linear: low(-1) -> endpoint均值(0) -> high(+1)，整条路径只算一套共同归因。
+# quadratic: 唯一通过 low(-1)、base(0)、high(+1) 的三点二次曲线，整条路径只算一套共同归因。
+path_method: "piecewise_linear"
+
+# 只审计已有贡献矩阵：不执行 backward，也不改写 safetensors；仅更新 metadata。
+completeness_only: true
+# 仅 piecewise_linear 使用此项；连续路径固定积分 low(-1) -> high(+1)，输出 common。
+target_poles: ["high", "low"]
+
+# piecewise_linear 每个极从 t=0 向对应 endpoint 归因。
+# endpoint_linear/quadratic 直接在完整的 t=-1 -> +1 路径上归因。
+# interpolation 只决定沿路径的行进速度，不能替代上面的 path_method：
+# linear 为匀速；parabolic 在路径中心附近减速，并包含正确的 dt/dalpha。
+interpolation: "linear"
+# K=1: endpoint gradient × 路径净位移（近似基线）。
+# K>1: Gauss-Legendre 积分，每点乘真实 dtheta/dalpha。
+# 支持 1, 2, 4, 8, 16, 32, 64。
+k: 8
+
+# BIG5-CHAT matched target/counter completions，L_plus/L_star 语义不变。
+# 连续路径固定 high 方向：L_plus=high logp，L_star=-low logp。
+# piecewise 的 high/low 分支仍分别以对应极为 target。
+# L_contrast 不另存一份巨大的矩阵，下游按 L_plus+L_star 使用。
+dataset_path: "/mnt/nvme2/models/amadeus/dataset_zoo/big5_chat"
+trait: "Extraversion"
+attribution_split: "val"
+val_ratio: 0.1
+seed: 42
+max_samples: 200
+filter_refusals: true
+use_original_prompt: false
+dialogue_prompt: >-
+  You are Speaker Y in a fictional two-person dialogue.
+  The user message is Speaker X's latest utterance.
+  Write Speaker Y's next utterance.
+  Any names refer only to participants in the current dialogue,
+  not to your permanent identity.
+  Output only Speaker Y's utterance, without speaker labels,
+  narration, explanations, or meta-commentary.
+
+dtype: "bfloat16"
+device_map: "balanced"
+batch_size: 8
+max_length: 1024
+
+# 模型只加载一次，各归因路径/两个目标通道依次反传；base 与两份 delta 在 CPU。
+# piecewise 输出 output_dir/<path_method>/<output_name>/<high|low>/。
+# endpoint_linear/quadratic 输出 output_dir/<path_method>/<output_name>/common/。
+#   Extraversion-<high|low|common>-linear-K8-L_plus.safetensors
+#   Extraversion-<high|low|common>-linear-K8-L_star.safetensors
+#   attribution_metadata.json
+# output_name 为 null 时自动使用 trait + 两个 endpoint 路径的短哈希。
+# 改变 K/数据/模型设置时使用新的 output_name 保留独立实验。
+output_dir: "/mnt/nvme2/models/amadeus/cpvm_output/path_integral"
+output_name: "extraversion-high-low"
+
+# 仅 piecewise_linear 允许复用；其他路径必须保持 null。
+# 显式提供的目录须各含一对匹配的 L_plus/L_star；有metadata时核对模型/数据设置。
+# 历史无metadata结果只能核对文件名中的 trait/pole/interpolation/K，来源由你保证。
+# 复用使用硬链接（跨文件系统时复制），不移动或改写原目录；两极均复用时不加载模型。
+reuse_contribution_dirs: null
+# reuse_contribution_dirs:
+#   high: "/mnt/nvme2/models/amadeus/cpvm_output/path_integral/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-high-ep10-checkpoint-1000"
+#   low: "/mnt/nvme2/models/amadeus/cpvm_output/path_integral/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-low-ep5-checkpoint-800"

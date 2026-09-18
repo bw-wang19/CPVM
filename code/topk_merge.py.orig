@@ -1,0 +1,730 @@
+"""Merge globally top-ranked CPVM parameters into a base model checkpoint.
+
+The main CPVM mode ranks strictly positive signed contributions, so updates
+that oppose the target objective are never merged. Absolute-value ranking is
+kept only as an explicitly named legacy ablation. Additional baselines rank
+the magnitude of the SFT change or the magnitude of the SFT endpoint itself.
+The selected weights follow
+
+    theta_out = theta_base + alpha * (theta_finetuned - theta_base).
+
+DaRE-style rescaling divides each selected update by the retained fraction.
+
+The global threshold is found exactly with four streaming radix passes over
+the FP32 contribution file. This avoids materializing or sorting four billion
+contribution values in memory.
+"""
+
+from __future__ import annotations
+
+from contextlib import ExitStack
+from dataclasses import asdict, dataclass
+import gc
+import json
+import math
+from pathlib import Path
+import re
+from typing import Iterator
+
+import numpy as np
+from safetensors import safe_open
+import torch
+from tqdm.auto import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from CPVM.code.utils.arguments import parse_args_yaml
+
+
+RADIX_SHIFTS = (24, 16, 8, 0)
+CONTRIBUTION_CHANNELS = ("L_plus", "L_star", "L_contrast")
+RANKING_METHODS = (
+    "contribution",
+    "delta_magnitude",
+    "finetuned_magnitude",
+)
+
+
+@dataclass(frozen=True)
+class TopKSelection:
+    """Exact global Top-k threshold and the number of threshold ties to keep."""
+
+    total_numel: int
+    selected_numel: int
+    threshold_bits: int | None
+    threshold_score: float | None
+    threshold_ties_to_keep: int
+    select_all: bool = False
+
+
+class ModelTensorReader:
+    """Read a full-model safetensors checkpoint, including sharded models."""
+
+    def __init__(self, model_path: str | Path):
+        self.model_path = Path(model_path)
+        self.stack = ExitStack()
+
+    def __enter__(self):
+        index_path = self.model_path / "model.safetensors.index.json"
+        if index_path.exists():
+            with index_path.open("r", encoding="utf-8") as file:
+                self.weight_map = json.load(file)["weight_map"]
+            filenames = sorted(set(self.weight_map.values()))
+        else:
+            filenames = ["model.safetensors"]
+            with safe_open(
+                str(self.model_path / filenames[0]), framework="pt", device="cpu"
+            ) as handle:
+                self.weight_map = {name: filenames[0] for name in handle.keys()}
+
+        self.handles = {
+            filename: self.stack.enter_context(
+                safe_open(
+                    str(self.model_path / filename), framework="pt", device="cpu"
+                )
+            )
+            for filename in filenames
+        }
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.stack.close()
+
+    @property
+    def keys(self) -> set[str]:
+        """Return all tensor names in the checkpoint."""
+
+        return set(self.weight_map)
+
+    def shape(self, name: str) -> tuple[int, ...]:
+        """Return one tensor's shape without loading its values."""
+
+        handle = self.handles[self.weight_map[name]]
+        return tuple(handle.get_slice(name).get_shape())
+
+    def read(self, name: str, index):
+        """Read one tensor or one first-dimension slice from disk."""
+
+        handle = self.handles[self.weight_map[name]]
+        if index is None:
+            return handle.get_tensor(name)
+        return handle.get_slice(name)[index]
+
+
+def chunk_indices(shape: tuple[int, ...], max_numel: int) -> Iterator[object]:
+    """Yield first-dimension slices whose tensors contain at most max_numel values."""
+
+    if not shape:
+        yield None
+        return
+
+    row_numel = math.prod(shape[1:]) if len(shape) > 1 else 1
+    rows_per_chunk = max(1, max_numel // row_numel)
+    trailing = (slice(None),) * (len(shape) - 1)
+    for start in range(0, shape[0], rows_per_chunk):
+        stop = min(start + rows_per_chunk, shape[0])
+        yield (slice(start, stop),) + trailing
+
+
+def contribution_chunks(handle, name: str, max_numel: int):
+    """Yield indexed, flattened FP32 chunks from one contribution tensor."""
+
+    tensor_slice = handle.get_slice(name)
+    shape = tuple(tensor_slice.get_shape())
+    for index in chunk_indices(shape, max_numel):
+        tensor = handle.get_tensor(name) if index is None else tensor_slice[index]
+        yield index, tensor.reshape(-1).float()
+
+
+def resolve_contribution_paths(
+    l_plus_contribution_path: str | Path,
+    l_star_contribution_path: str | Path | None,
+    contribution_channel: str,
+) -> list[str | Path]:
+    """Return the contribution files used by one objective channel."""
+
+    if contribution_channel == "L_plus":
+        return [l_plus_contribution_path]
+    if contribution_channel == "L_star":
+        if l_star_contribution_path is None:
+            raise ValueError("L_star requires l_star_contribution_path")
+        return [l_star_contribution_path]
+    if contribution_channel == "L_contrast":
+        if l_star_contribution_path is None:
+            raise ValueError("L_contrast requires l_star_contribution_path")
+        return [l_plus_contribution_path, l_star_contribution_path]
+    raise ValueError(
+        f"contribution_channel must be one of {CONTRIBUTION_CHANNELS}"
+    )
+
+
+def combined_contribution_chunks(handles, name: str, max_numel: int):
+    """Yield one channel or the FP32 per-chunk sum of aligned channels."""
+
+    tensor_slices = [handle.get_slice(name) for handle in handles]
+    shape = tuple(tensor_slices[0].get_shape())
+    if any(
+        tuple(tensor_slice.get_shape()) != shape
+        for tensor_slice in tensor_slices[1:]
+    ):
+        raise ValueError(f"Contribution shape mismatch between channels: {name}")
+
+    for index in chunk_indices(shape, max_numel):
+        combined = None
+        for handle, tensor_slice in zip(handles, tensor_slices):
+            tensor = handle.get_tensor(name) if index is None else tensor_slice[index]
+            values = tensor.reshape(-1).float()
+            combined = values.clone() if combined is None else combined.add_(values)
+        yield index, combined
+
+
+def absolute_float_bits(values: torch.Tensor) -> np.ndarray:
+    """Return monotonic IEEE uint32 keys for absolute FP32 contributions."""
+
+    magnitudes = values.float().abs().contiguous().numpy()
+    return magnitudes.view(np.uint32)
+
+
+def positive_float_bits(values: torch.Tensor) -> np.ndarray:
+    """Return monotonic keys for positive values and zero for other values."""
+
+    values = values.float()
+    positive = torch.where(values > 0, values, torch.zeros_like(values))
+    return positive.contiguous().numpy().view(np.uint32)
+
+
+def contribution_score_bits(
+    values: torch.Tensor,
+    selection_mode: str,
+) -> np.ndarray:
+    """Encode the contribution score used by one explicit selection mode."""
+
+    if selection_mode == "positive":
+        return positive_float_bits(values)
+    if selection_mode == "absolute":
+        return absolute_float_bits(values)
+    raise ValueError("selection_mode must be 'positive' or 'absolute'")
+
+
+def find_topk_selection(
+    l_plus_contribution_path: str | Path,
+    k_percent: float,
+    chunk_numel: int = 5_000_000,
+    selection_mode: str = "absolute",
+    l_star_contribution_path: str | Path | None = None,
+    contribution_channel: str = "L_plus",
+) -> TopKSelection:
+    """Find an exact global contribution threshold using four radix scans.
+
+    k_percent always uses all model scalars as its denominator. Positive mode
+    excludes contributions less than or equal to zero instead of filling the
+    requested budget with updates that oppose the target objective. L_contrast
+    ranks the elementwise FP32 sum L_plus + L_star without writing a new file.
+    """
+
+    if not 0 <= k_percent <= 100:
+        raise ValueError("k_percent must be between 0 and 100")
+    if selection_mode not in {"positive", "absolute"}:
+        raise ValueError("selection_mode must be 'positive' or 'absolute'")
+
+    contribution_paths = resolve_contribution_paths(
+        l_plus_contribution_path,
+        l_star_contribution_path,
+        contribution_channel,
+    )
+    with ExitStack() as stack:
+        handles = [
+            stack.enter_context(
+                safe_open(str(path), framework="pt", device="cpu")
+            )
+            for path in contribution_paths
+        ]
+        names = sorted(handles[0].keys())
+        if any(set(handle.keys()) != set(names) for handle in handles[1:]):
+            raise ValueError("L_plus and L_star parameter names do not match")
+        total_numel = sum(
+            math.prod(handles[0].get_slice(name).get_shape()) for name in names
+        )
+        selected_numel = math.ceil(total_numel * k_percent / 100)
+
+        if selected_numel == 0:
+            return TopKSelection(total_numel, 0, None, None, 0)
+        if selection_mode == "absolute" and selected_numel == total_numel:
+            return TopKSelection(total_numel, total_numel, None, None, 0, True)
+
+        rank = selected_numel
+        prefix = 0
+        positive_numel = 0
+        for step, shift in enumerate(RADIX_SHIFTS, start=1):
+            counts = np.zeros(256, dtype=np.int64)
+            description = f"Selecting Top-k threshold ({step}/{len(RADIX_SHIFTS)})"
+            for name in tqdm(names, desc=description, unit="tensor"):
+                for _, chunk in combined_contribution_chunks(
+                    handles, name, chunk_numel
+                ):
+                    if shift == RADIX_SHIFTS[0]:
+                        if not torch.isfinite(chunk).all():
+                            raise ValueError(
+                                f"Contribution tensor contains NaN or Inf: {name}"
+                            )
+                        if selection_mode == "positive":
+                            positive_numel += int(torch.count_nonzero(chunk > 0))
+                    bits = contribution_score_bits(chunk, selection_mode)
+                    if shift != RADIX_SHIFTS[0]:
+                        bits = bits[(bits >> (shift + 8)) == prefix]
+                    digits = (bits >> shift) & np.uint32(0xFF)
+                    counts += np.bincount(digits, minlength=256)
+
+            if (
+                step == 1
+                and selection_mode == "positive"
+                and selected_numel > positive_numel
+            ):
+                positive_percent = 100 * positive_numel / total_numel
+                raise ValueError(
+                    f"Top {k_percent:g}% requests {selected_numel:,} scalars, "
+                    f"but only {positive_numel:,}/{total_numel:,} "
+                    f"({positive_percent:.8f}%) contributions are positive"
+                )
+
+            for digit in range(255, -1, -1):
+                digit_count = int(counts[digit])
+                if rank > digit_count:
+                    rank -= digit_count
+                    continue
+                prefix = (prefix << 8) | digit
+                break
+
+        threshold_score = np.array([prefix], dtype=np.uint32).view(np.float32)[0]
+        return TopKSelection(
+            total_numel=total_numel,
+            selected_numel=selected_numel,
+            threshold_bits=prefix,
+            threshold_score=float(threshold_score),
+            threshold_ties_to_keep=rank,
+        )
+
+
+def model_ranking_chunks(
+    parameters: dict[str, torch.nn.Parameter],
+    finetuned: ModelTensorReader,
+    name: str,
+    max_numel: int,
+    ranking_method: str,
+):
+    """Yield FP32 parameter scores for |delta| or |theta_finetuned| ranking."""
+
+    parameter = parameters[name]
+    shape = tuple(parameter.shape)
+    if finetuned.shape(name) != shape:
+        raise ValueError(f"Shape mismatch for parameter: {name}")
+
+    for index in chunk_indices(shape, max_numel):
+        base_chunk = parameter.data if index is None else parameter.data[index]
+        finetuned_chunk = finetuned.read(name, index).reshape(-1)
+        if ranking_method == "delta_magnitude":
+            scores = finetuned_chunk.float().sub(base_chunk.reshape(-1).float())
+        elif ranking_method == "finetuned_magnitude":
+            scores = finetuned_chunk.float()
+        else:
+            raise ValueError(f"Unsupported model ranking method: {ranking_method}")
+        yield index, scores
+
+
+def find_model_topk_selection(
+    parameters: dict[str, torch.nn.Parameter],
+    finetuned_model_path: str | Path,
+    k_percent: float,
+    ranking_method: str,
+    chunk_numel: int = 5_000_000,
+) -> TopKSelection:
+    """Find the exact global Top-k threshold for a model-weight ranking."""
+
+    if ranking_method not in RANKING_METHODS[1:]:
+        raise ValueError(f"ranking_method must be one of {RANKING_METHODS}")
+    if not 0 <= k_percent <= 100:
+        raise ValueError("k_percent must be between 0 and 100")
+
+    names = sorted(parameters)
+    total_numel = sum(parameter.numel() for parameter in parameters.values())
+    selected_numel = math.ceil(total_numel * k_percent / 100)
+    if selected_numel == 0:
+        return TopKSelection(total_numel, 0, None, None, 0)
+    if selected_numel == total_numel:
+        return TopKSelection(total_numel, total_numel, None, None, 0, True)
+
+    with ModelTensorReader(finetuned_model_path) as finetuned:
+        if not set(names).issubset(finetuned.keys):
+            raise ValueError("Base and fine-tuned parameter names do not match")
+
+        rank = selected_numel
+        prefix = 0
+        for step, shift in enumerate(RADIX_SHIFTS, start=1):
+            counts = np.zeros(256, dtype=np.int64)
+            description = (
+                f"Selecting {ranking_method} threshold "
+                f"({step}/{len(RADIX_SHIFTS)})"
+            )
+            for name in tqdm(names, desc=description, unit="tensor"):
+                for _, scores in model_ranking_chunks(
+                    parameters,
+                    finetuned,
+                    name,
+                    chunk_numel,
+                    ranking_method,
+                ):
+                    if shift == RADIX_SHIFTS[0] and not torch.isfinite(scores).all():
+                        raise ValueError(f"Model tensor contains NaN or Inf: {name}")
+                    bits = absolute_float_bits(scores)
+                    if shift != RADIX_SHIFTS[0]:
+                        bits = bits[(bits >> (shift + 8)) == prefix]
+                    digits = (bits >> shift) & np.uint32(0xFF)
+                    counts += np.bincount(digits, minlength=256)
+
+            for digit in range(255, -1, -1):
+                digit_count = int(counts[digit])
+                if rank > digit_count:
+                    rank -= digit_count
+                    continue
+                prefix = (prefix << 8) | digit
+                break
+
+    threshold_score = np.array([prefix], dtype=np.uint32).view(np.float32)[0]
+    return TopKSelection(
+        total_numel=total_numel,
+        selected_numel=selected_numel,
+        threshold_bits=prefix,
+        threshold_score=float(threshold_score),
+        threshold_ties_to_keep=rank,
+    )
+
+
+def selection_mask(
+    score_bits: np.ndarray,
+    selection: TopKSelection,
+    ties_remaining: int,
+) -> tuple[np.ndarray, int]:
+    """Select one chunk while resolving threshold ties in deterministic order."""
+
+    if selection.select_all:
+        return np.ones(score_bits.shape, dtype=bool), ties_remaining
+    if selection.threshold_bits is None:
+        return np.zeros(score_bits.shape, dtype=bool), ties_remaining
+
+    selected = score_bits > np.uint32(selection.threshold_bits)
+    if ties_remaining:
+        equal_indices = np.flatnonzero(score_bits == selection.threshold_bits)
+        take = min(ties_remaining, len(equal_indices))
+        selected[equal_indices[:take]] = True
+        ties_remaining -= take
+    return selected, ties_remaining
+
+
+def merge_selected_values(
+    base_values: torch.Tensor,
+    finetuned_values: torch.Tensor,
+    selected_indices: torch.Tensor,
+    alpha: float,
+) -> None:
+    """Merge selected flattened values into the base tensor in place."""
+
+    if alpha == 0 or selected_indices.numel() == 0:
+        return
+
+    finetuned_selected = finetuned_values.index_select(0, selected_indices)
+    if alpha == 1:
+        merged = finetuned_selected.to(base_values.dtype)
+    else:
+        base_selected = base_values.index_select(0, selected_indices).float()
+        merged = base_selected.add_(
+            finetuned_selected.float().sub_(base_selected), alpha=alpha
+        ).to(base_values.dtype)
+    base_values.index_copy_(0, selected_indices, merged)
+
+
+def resolve_dtype(dtype: str):
+    """Resolve a YAML dtype name for Transformers model loading."""
+
+    if dtype == "auto":
+        return "auto"
+    return {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }[dtype]
+
+
+def build_run_name(
+    experiment_name: str,
+    k_percent: float,
+    alpha: float,
+    selection_mode: str,
+    contribution_channel: str = "L_plus",
+    use_weight_rescale: bool = False,
+    ranking_method: str = "contribution",
+) -> str:
+    """Build a name that records the ranking source, k, alpha, and scaling."""
+
+    prefix = re.sub(r"[^A-Za-z0-9_.-]+", "-", experiment_name).strip("-")
+    rescale_tag = "-dare-rescaled" if use_weight_rescale else ""
+    if ranking_method == "contribution":
+        ranking_tag = f"{contribution_channel}-top-{selection_mode}"
+    else:
+        ranking_tag = f"{ranking_method.replace('_', '-')}-top-"
+    return f"{prefix}-{ranking_tag}{k_percent:g}pct-alpha{alpha:g}{rescale_tag}"
+
+
+def merge_topk_parameters(
+    base_model_path: str,
+    finetuned_model_path: str,
+    l_plus_contribution_path: str,
+    merged_model_output_path: str,
+    k_percent: float,
+    alpha: float,
+    selection_mode: str = "positive",
+    l_star_contribution_path: str | None = None,
+    contribution_channel: str = "L_plus",
+    use_weight_rescale: bool = False,
+    ranking_method: str = "contribution",
+    merge_dtype: str = "auto",
+    chunk_numel: int = 5_000_000,
+    max_shard_size: str = "5GB",
+) -> TopKSelection:
+    """Merge exact global Top-k scalars selected by the requested ranking."""
+
+    if ranking_method not in RANKING_METHODS:
+        raise ValueError(f"ranking_method must be one of {RANKING_METHODS}")
+    if use_weight_rescale and k_percent == 0:
+        raise ValueError("DaRE-style rescaling is undefined when k_percent is 0")
+
+    output_path = Path(merged_model_output_path)
+    source_paths = {
+        Path(base_model_path).resolve(),
+        Path(finetuned_model_path).resolve(),
+    }
+    if output_path.resolve() in source_paths:
+        raise ValueError("merged_model_output_path must differ from both source models")
+
+    print(f"Loading base model from {base_model_path}")
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model_path,
+        trust_remote_code=True,
+        dtype=resolve_dtype(merge_dtype),
+        device_map={"": "cpu"},
+        low_cpu_mem_usage=True,
+    )
+    parameters = dict(model.named_parameters())
+
+    if ranking_method == "contribution":
+        selection = find_topk_selection(
+            l_plus_contribution_path,
+            k_percent,
+            chunk_numel,
+            selection_mode=selection_mode,
+            l_star_contribution_path=l_star_contribution_path,
+            contribution_channel=contribution_channel,
+        )
+        ranking_label = f"{contribution_channel}/{selection_mode}"
+    else:
+        selection = find_model_topk_selection(
+            parameters,
+            finetuned_model_path,
+            k_percent,
+            ranking_method,
+            chunk_numel,
+        )
+        ranking_label = ranking_method
+
+    print(
+        f"Selected {selection.selected_numel:,}/{selection.total_numel:,} parameters "
+        f"({100 * selection.selected_numel / selection.total_numel:.8f}%) "
+        f"with ranking_method={ranking_label}."
+    )
+    if selection.threshold_score is not None:
+        print(f"Global {ranking_label} threshold: {selection.threshold_score:.8e}")
+
+    retain_rate = k_percent / 100
+    rescale_factor = 1 / retain_rate if use_weight_rescale else 1.0
+    effective_alpha = alpha * rescale_factor
+    print(
+        f"Weight rescale={'DaRE' if use_weight_rescale else 'none'}; "
+        f"rescale_factor={rescale_factor:g}; effective_alpha={effective_alpha:g}",
+        flush=True,
+    )
+
+    contribution_paths = (
+        resolve_contribution_paths(
+            l_plus_contribution_path,
+            l_star_contribution_path,
+            contribution_channel,
+        )
+        if ranking_method == "contribution"
+        else []
+    )
+
+    ties_remaining = selection.threshold_ties_to_keep
+    merged_numel = 0
+    with ExitStack() as stack:
+        contributions = [
+            stack.enter_context(
+                safe_open(str(path), framework="pt", device="cpu")
+            )
+            for path in contribution_paths
+        ]
+        finetuned = stack.enter_context(ModelTensorReader(finetuned_model_path))
+        stack.enter_context(torch.no_grad())
+
+        if ranking_method == "contribution":
+            names = sorted(contributions[0].keys())
+            if any(set(handle.keys()) != set(names) for handle in contributions[1:]):
+                raise ValueError("L_plus and L_star parameter names do not match")
+            if set(names) != set(parameters) or not set(names).issubset(finetuned.keys):
+                raise ValueError(
+                    "Contribution, base, and fine-tuned parameter names do not match"
+                )
+        else:
+            names = sorted(parameters)
+            if not set(names).issubset(finetuned.keys):
+                raise ValueError("Base and fine-tuned parameter names do not match")
+
+        for name in tqdm(names, desc="Merging Top-k parameters", unit="tensor"):
+            parameter = parameters[name]
+            if ranking_method == "contribution":
+                shape = tuple(contributions[0].get_slice(name).get_shape())
+                score_chunks = combined_contribution_chunks(
+                    contributions, name, chunk_numel
+                )
+            else:
+                shape = tuple(parameter.shape)
+                score_chunks = model_ranking_chunks(
+                    parameters,
+                    finetuned,
+                    name,
+                    chunk_numel,
+                    ranking_method,
+                )
+
+            if tuple(parameter.shape) != shape or finetuned.shape(name) != shape:
+                raise ValueError(f"Shape mismatch for parameter: {name}")
+
+            for index, scores in score_chunks:
+                score_bits = (
+                    contribution_score_bits(scores, selection_mode)
+                    if ranking_method == "contribution"
+                    else absolute_float_bits(scores)
+                )
+                mask, ties_remaining = selection_mask(
+                    score_bits,
+                    selection,
+                    ties_remaining,
+                )
+                selected_indices = torch.from_numpy(np.flatnonzero(mask))
+                merged_numel += selected_indices.numel()
+                if effective_alpha == 0 or selected_indices.numel() == 0:
+                    continue
+
+                base_chunk = parameter.data if index is None else parameter.data[index]
+                finetuned_chunk = finetuned.read(name, index).reshape(-1)
+                merge_selected_values(
+                    base_chunk.reshape(-1),
+                    finetuned_chunk,
+                    selected_indices,
+                    effective_alpha,
+                )
+
+    if merged_numel != selection.selected_numel or ties_remaining != 0:
+        raise RuntimeError("Top-k merge count did not match the requested parameter count")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        finetuned_model_path,
+        trust_remote_code=True,
+        use_fast=False,
+    )
+    print(f"Saving merged model to {output_path}")
+    output_path.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(
+        output_path,
+        safe_serialization=True,
+        max_shard_size=max_shard_size,
+    )
+    tokenizer.save_pretrained(output_path)
+
+    del parameters
+    del tokenizer, model
+    gc.collect()
+    return selection
+
+
+def run_topk_merge(
+    base_model_path: str,
+    finetuned_model_path: str,
+    l_plus_contribution_path: str,
+    k_percent: float,
+    alpha: float,
+    output_dir: str,
+    experiment_name: str | None = None,
+    selection_mode: str = "positive",
+    l_star_contribution_path: str | None = None,
+    contribution_channel: str = "L_plus",
+    use_weight_rescale: bool = False,
+    ranking_method: str = "contribution",
+    merge_dtype: str = "auto",
+    chunk_numel: int = 5_000_000,
+    max_shard_size: str = "5GB",
+) -> dict:
+    """Merge the requested global Top-k parameters and save one HF checkpoint."""
+
+    default_name = Path(l_plus_contribution_path).stem.removesuffix("-L_plus")
+    run_name = build_run_name(
+        experiment_name or default_name,
+        k_percent,
+        alpha,
+        selection_mode,
+        contribution_channel,
+        use_weight_rescale,
+        ranking_method,
+    )
+    output_path = str(Path(output_dir) / run_name)
+    selection = merge_topk_parameters(
+        base_model_path=base_model_path,
+        finetuned_model_path=finetuned_model_path,
+        l_plus_contribution_path=l_plus_contribution_path,
+        merged_model_output_path=output_path,
+        k_percent=k_percent,
+        alpha=alpha,
+        selection_mode=selection_mode,
+        l_star_contribution_path=l_star_contribution_path,
+        contribution_channel=contribution_channel,
+        use_weight_rescale=use_weight_rescale,
+        ranking_method=ranking_method,
+        merge_dtype=merge_dtype,
+        chunk_numel=chunk_numel,
+        max_shard_size=max_shard_size,
+    )
+
+    summary = {
+        "run_name": run_name,
+        "output_path": output_path,
+        "k_percent": k_percent,
+        "alpha": alpha,
+        "ranking_method": ranking_method,
+        "use_weight_rescale": use_weight_rescale,
+        "rescale_factor": 100 / k_percent if use_weight_rescale else 1.0,
+        "contribution_channel": contribution_channel,
+        "l_plus_contribution_path": l_plus_contribution_path,
+        "l_star_contribution_path": l_star_contribution_path,
+        "selection_mode": selection_mode,
+        "selection": asdict(selection),
+    }
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return summary
+
+
+def main() -> None:
+    """Load the YAML interface, merge Top-k parameters, and save the model."""
+
+    config = parse_args_yaml("Global Top-k parameter merge")
+    run_topk_merge(**config)
+
+
+if __name__ == "__main__":
+    main()

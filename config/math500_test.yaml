@@ -1,0 +1,65 @@
+# Models are evaluated strictly in list order. Add/remove paths as needed.
+model_paths:
+  - "/mnt/nvme2/models/amadeus/model_zoo/qwen3-4b-instruct-2507"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-high-ep10/checkpoint-1000"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-low-ep5/checkpoint-800"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Conscientiousness-high-ep5/checkpoint-1000"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Conscientiousness-low-ep5/checkpoint-1000"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/topk_merge/extraversion-high-L_contrast-top-positive5pct-alpha1"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/topk_merge/extraversion-low-L_contrast-top-positive5pct-alpha1"
+  # - "/path/to/another/model-or-checkpoint"
+
+dataset_path: "/mnt/nvme2/models/amadeus/dataset_zoo/MATH-500"
+output_path: "/mnt/nvme2/models/amadeus/cpvm_output/test/math500"
+test_name: "prm800k-zeroshot-cot-v1"
+expected_num_questions: 500
+
+# Fixed comparison protocol:
+#   OpenAI PRM800K MATH-500 test split, 0-shot CoT, model chat template,
+#   final balanced \boxed{...}, and OpenAI PRM800K grade_answer.
+# There is no single official MATH prompt. This explicit prompt is held fixed
+# across all models and the exact text is saved in every result JSON.
+#
+# Solve the following problem step by step.
+# Put your final answer in \boxed{ANSWER}.
+#
+# Problem:
+# {problem}
+
+# Canonical deterministic setting: Avg@1 with greedy decoding.
+# For Avg@N, set samples_per_question: N and temperature > 0. The report also
+# records Test@N (at least one correct generation for a question).
+samples_per_question: 1
+temperature: 0.0
+top_p: 1.0
+top_k: -1
+min_p: 0.0
+presence_penalty: 0.0
+repetition_penalty: 1.0
+sampling_seed: 0
+
+# Two independent single-GPU AsyncLLMEngine replicas pull individual samples
+# from one queue. A Cantor pairing maps (question, sample) to a unique seed, so
+# seeds do not depend on GPU scheduling or change when Avg@N changes.
+data_parallel_size: 2
+work_size: 16
+gpu_memory_utilization: 0.95
+dtype: "auto"
+max_new_tokens: 8192
+max_model_len: 16384
+stop:
+  - "</s>"
+  - "<|im_end|>"
+
+# Abort a model cleanly if workers stay alive without returning any sample, or
+# if vLLM does not shut down after every result has been collected.
+inactivity_timeout_seconds: 900
+worker_shutdown_timeout_seconds: 120
+
+# Prevent one pathological symbolic expression from stalling the evaluation.
+grading_timeout_seconds: 2.0
+max_answer_chars: 2048
+
+# MATH-500 is public; retain raw generations so disputed parses can be audited.
+save_responses: false
+

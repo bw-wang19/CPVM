@@ -1,0 +1,29 @@
+base_model_path: "/mnt/nvme2/models/amadeus/model_zoo/qwen3-4b-instruct-2507"
+finetuned_model_path: "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-high-ep10/checkpoint-1000"
+
+# Dedicated scratch/working root.  The orchestrator deletes each completed
+# non-final seed before generating the next, so at most four new checkpoints
+# are retained.  On normal completion only the final seed remains here.
+output_dir: "/mnt/nvme2/models/amadeus/cpvm_output/dare_trait_seed_sweep_working"
+
+# Fixed five-seed DaRE sweep.  Seed 0 and the earlier trial seeds are excluded.
+seeds: [416635, 995299, 389122, 201088, 978719]
+# Used only when invoking the single-seed merge/evaluate modules directly.
+seed: 416635
+retain_percentages: [1, 5, 10, 20]
+
+# This run is deliberately DaRE + TRAIT only.
+include_task_vector: false
+
+# MergeLM performs its original CPU arithmetic in FP32. Checkpoints are saved
+# in BF16 so the Qwen3-4B variants fit the existing two-GPU TRAIT protocol.
+merge_dtype: "float32"
+save_dtype: "bfloat16"
+max_shard_size: "5GB"
+skip_existing: true
+
+# Each seed receives its own result subdirectory.  JSON results and summaries
+# remain after the temporary checkpoints from earlier seeds are removed.
+trait_config_path: "/home/wbw/workspace/CPVM/config/trait_test.yaml"
+result_output_dir: "/mnt/nvme2/models/amadeus/cpvm_output/test/dare_trait_seed_sweep"
+test_name: "dare-trait-five-seed-20260904"

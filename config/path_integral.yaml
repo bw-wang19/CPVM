@@ -1,0 +1,47 @@
+# Base and one High/Low full-parameter endpoint define one piecewise branch.
+# For three-model geometry use bipolar_path_integral.yaml instead.
+path_method: "piecewise_linear"
+base_model_path: "/mnt/nvme2/models/amadeus/model_zoo/qwen3-4b-instruct-2507"
+endpoint_model_path: "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Conscientiousness-low-ep5/checkpoint-1000"
+
+# BIG5-CHAT supplies matched target-pole and counter-pole completions.
+dataset_path: "/mnt/nvme2/models/amadeus/dataset_zoo/big5_chat"
+trait: "Conscientiousness"
+target_pole: "low"
+attribution_split: "val"
+val_ratio: 0.1
+seed: 42
+max_samples: 200
+filter_refusals: true
+
+# Keep the attribution prompt neutral, matching the full-SFT setup.
+use_original_prompt: false
+dialogue_prompt: >-
+  You are Speaker Y in a fictional two-person dialogue.
+  The user message is Speaker X's latest utterance.
+  Write Speaker Y's next utterance.
+  Any names refer only to participants in the current dialogue,
+  not to your permanent identity.
+  Output only Speaker Y's utterance, without speaker labels,
+  narration, explanations, or meta-commentary.
+
+# interpolation: linear uses alpha; parabolic uses alpha^2.
+interpolation: "linear"
+# Supported K values: 1, 2, 4, 8, 16, 32, 64.
+# K=1 is endpoint-gradient x delta; K>1 uses Gauss-Legendre quadrature.
+k: 8
+
+dtype: "bfloat16"
+device_map: "balanced"
+batch_size: 8
+max_length: 1024
+
+# 输出结构：output_dir/piecewise_linear/<output_name 或 SFT实验名-checkpoint>/
+#           <trait>-<target_pole>-<interpolation>-K<k>-L_plus.safetensors
+#           <trait>-<target_pole>-<interpolation>-K<k>-L_star.safetensors
+# output_name 只用于覆盖子目录名；null 时根据 endpoint_model_path 自动生成。
+# 下游只配置 contribution_dir，因此一个子目录应只保存这一组匹配的 L_plus/L_star。
+# 每个 safetensors 只包含 parameter_name -> 同形状 FP32 contribution tensor。
+# 同目录 attribution_metadata.json 记录路径、模型及归因设置；历史文件不搬迁。
+output_dir: "/mnt/nvme2/models/amadeus/cpvm_output/path_integral"
+output_name: null

@@ -1,0 +1,74 @@
+# --- ModelArguments ---
+model_name_or_path: "/mnt/nvme2/models/amadeus/model_zoo/qwen3-4b-instruct-2507"
+finetune_type: "full"  # "full" or "lora"
+resume_wandb_run_id: null
+
+# --- MedMCQADataArguments ---
+# Only data/train-*.parquet is used for optimization.  Training-time evaluation
+# always uses data/validation-*.parquet; the unlabeled test split is never read.
+data_path: "/mnt/nvme2/models/amadeus/dataset_zoo/medmcqa"
+max_length: 1024
+include_explanation: true
+drop_overlength: true
+dataset_num_proc: 8
+max_train_samples: null
+max_eval_samples: null
+preview_samples: 2
+
+# --- LoraArguments ---
+# These fields are ignored when finetune_type is "full".
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+target_modules:
+  - "q_proj"
+  - "k_proj"
+  - "v_proj"
+  - "o_proj"
+  - "gate_proj"
+  - "up_proj"
+  - "down_proj"
+
+# --- TrainingArguments ---
+seed: 42
+data_seed: 42
+do_train: true
+do_eval: true
+do_predict: false
+
+# One epoch covers the complete official 182,822-example training split.
+num_train_epochs: 2
+max_steps: 3000
+per_device_train_batch_size: 4
+per_device_eval_batch_size: 4
+gradient_accumulation_steps: 8
+
+learning_rate: 1.0e-5
+weight_decay: 0.0
+adam_beta1: 0.9
+adam_beta2: 0.999
+lr_scheduler_type: "linear"
+warmup_ratio: 0.03
+max_grad_norm: 1.0
+
+eval_strategy: "steps"
+eval_steps: 100
+logging_strategy: "steps"
+logging_steps: 10
+logging_dir: "/home/wbw/workspace/CPVM/logs/sft"
+report_to: "wandb"
+
+save_strategy: "steps"
+save_steps: 200
+save_total_limit: 10
+resume_from_checkpoint: "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-medmcqa-explanation-boxed-ep1/checkpoint-1800"
+output_dir: "/mnt/nvme2/models/amadeus/cpvm_output/sft"
+
+bf16: true
+fp16: false
+tf32: true
+gradient_checkpointing: true
+ddp_backend: "nccl"
+ddp_find_unused_parameters: false
+dataloader_num_workers: 4
+deepspeed: "/home/wbw/workspace/CPVM/config/ds_zero2.json"

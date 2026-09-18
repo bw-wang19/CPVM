@@ -1,0 +1,44 @@
+# 按列表顺序逐个评测，最后在 log 汇总模型得分表；继续加 - 路径即可。
+# 旧配置中的单个 model_path 仍可使用；同时填写时优先使用 model_paths。
+model_paths:
+  - "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-low-ep5/checkpoint-800"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/topk_merge/extraversion-low-L_contrast-top-positive1pct-alpha1"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/topk_merge/extraversion-low-L_contrast-top-positive5pct-alpha1" 
+  - "/mnt/nvme2/models/amadeus/cpvm_output/topk_merge/extraversion-low-L_contrast-top-positive10pct-alpha1"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/topk_merge/extraversion-low-L_contrast-top-positive20pct-alpha1"
+# 20% omitted after 10% showed severe output-length truncation.
+#  - "/path/to/another/model-or-checkpoint"
+dataset_path: "/mnt/nvme2/models/amadeus/dataset_zoo/gpqa"
+output_path: "/mnt/nvme2/models/amadeus/cpvm_output/test/gpqa"
+test_name: "qwen-official"
+
+# Two independent one-GPU vLLM replicas. Questions are pulled dynamically so
+# A GPU that finishes early immediately receives more questions.
+# work_size is the per-GPU maximum number of in-flight questions; each question
+# still uses one n-sample request.
+data_parallel_size: 2
+work_size: 8
+gpu_memory_utilization: 0.95
+dtype: "auto"
+
+# Qwen official GPQA-Diamond protocol for non-thinking Instruct models.
+# 10 reproduces avg@10; use a smaller value for quick length diagnostics.
+samples_per_question: 1
+temperature: 0.7
+top_p: 0.8
+top_k: 20
+min_p: 0.0
+presence_penalty: 1.5
+repetition_penalty: 1.0
+max_new_tokens: 32768
+# Leaves 4096 tokens for the chat-templated question and four choices.
+max_model_len: 36864
+
+# GPQA's public baseline defaults to choice seed 0. Qwen did not publish its
+# internal sampling seed, so the run records a fixed common seed explicitly.
+choice_seed: 0
+sampling_seed: 0
+
+# GPQA requests that benchmark examples not be exposed. Keep generated text out
+# of the report by default; predictions and scoring metadata are still saved.
+save_responses: false

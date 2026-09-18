@@ -1,0 +1,48 @@
+# Models are evaluated strictly in list order. Add/remove paths as needed.
+model_paths:
+  - "/mnt/nvme2/models/amadeus/model_zoo/qwen3-4b-instruct-2507"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-high-ep10/checkpoint-1000"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-low-ep5/checkpoint-800"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Conscientiousness-high-ep5/checkpoint-1000"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/topk_merge/extraversion-high-L_contrast-top-positive5pct-alpha1"
+  - "/mnt/nvme2/models/amadeus/cpvm_output/topk_merge/extraversion-low-L_contrast-top-positive5pct-alpha1"
+  # - "/path/to/another/model-or-checkpoint"
+
+dataset_path: "/mnt/nvme2/models/amadeus/dataset_zoo/gsm8k"
+output_path: "/mnt/nvme2/models/amadeus/cpvm_output/test/gsm8k"
+test_name: "lm-eval-cot-zeroshot-v3"
+expected_num_questions: 1319
+
+# Reproducible protocol:
+#   GSM8K main/test, lm-eval gsm8k_cot_zeroshot v3 prompt,
+#   0-shot CoT, chat template, normalized final-number exact match.
+# Protocol details:
+# Q: {question}
+# A: Let's think step by step.
+
+# The canonical deterministic setting is Avg@1 with temperature 0.
+# To run Avg@N, set samples_per_question: N and temperature > 0; the report
+# records both sample-average Avg@N and GSM8K-paper-style Test@N (any correct).
+samples_per_question: 1
+temperature: 0.0
+top_p: 1.0
+top_k: -1
+min_p: 0.0
+presence_penalty: 0.0
+repetition_penalty: 1.0
+sampling_seed: 0
+
+# Two independent one-GPU AsyncLLMEngine replicas. Individual samples are
+# dynamically pulled from one queue, so a free GPU immediately receives work.
+data_parallel_size: 2
+work_size: 16
+gpu_memory_utilization: 0.95
+dtype: "auto"
+max_new_tokens: 512
+max_model_len: 4096
+stop:
+  - "Q:"
+  - "</s>"
+  - "<|im_end|>"
+
+save_responses: false

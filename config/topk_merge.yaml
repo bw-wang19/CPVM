@@ -1,0 +1,92 @@
+# Main CPVM merge: rank raw contributions C from largest to smallest.
+# k_percent uses scalars in the selected layer/module scope as its denominator.
+base_model_path: "/mnt/nvme2/models/amadeus/model_zoo/qwen3-4b-instruct-2507"
+finetuned_model_path: "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-low-ep5/checkpoint-800"
+# 只指定包含唯一一对贡献矩阵的目录。程序自动匹配同前缀的
+# *-L_plus.safetensors 和 *-L_star.safetensors；L_contrast 运行时逐块相加。
+# random、模型幅值排序或指定范围的 k=100 不读取该目录，可设为 null。
+contribution_dir: "/mnt/nvme2/models/amadeus/cpvm_output/path_integral/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-low-ep5-checkpoint-800"
+contribution_channel: "L_contrast"  # L_plus, L_star, or L_contrast
+
+# layers / modules 写法（必须用列表或 null；不要写 modules: mlp 或 layers: 1）。
+# 当前 Qwen3-4B 有 36 个 transformer 层，编号从 0 到 35。
+# layers: null          所有层及层外参数均可参与。
+# layers: [0]           第 0 层；layers: [0, 1, 2] 表示这三个层。
+# 所有 transformer 层（不含 embedding 和最终 norm）：
+# layers: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+#          18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35]
+#
+# modules: null                  不限制模块。
+# modules: ["mlp"]               每层整个 MLP。
+# modules: ["self_attn"]         每层整个 attention（包括 q_norm/k_norm）。
+# modules: ["self_attn.q_proj", "mlp.gate_proj"]  多项取并集。
+# 等价的 YAML 多行列表：
+# modules:
+#   - self_attn.q_proj
+#   - mlp.gate_proj
+#
+# 当前模型所有层内可选模块（可以组合；父模块会包含其整个子树）：
+#   input_layernorm
+#   post_attention_layernorm
+#   self_attn
+#   self_attn.q_proj
+#   self_attn.k_proj
+#   self_attn.v_proj
+#   self_attn.o_proj
+#   self_attn.q_norm
+#   self_attn.k_norm
+#   mlp
+#   mlp.gate_proj
+#   mlp.up_proj
+#   mlp.down_proj
+# 层外参数（需 layers: null）：model.embed_tokens、model.norm。
+# 当前模型 lm_head 与 embedding 共享权重，使用 model.embed_tokens 选择。
+# 模块路径按点分隔的完整名字匹配；q_proj 也可以，q 或 attn 不可以。
+#
+# layers/modules 都为 null：原来的全局 Top-k。
+# 只指定 layers：在这些层的所有参数中统一选 Top-k。
+# 只指定 modules：在所有层匹配的模块中统一选 Top-k。
+# 两项都指定：取交集，如 layers: [0, 1] + modules: ["mlp"]。
+# k_percent 的分母为候选范围参数量；日志仍输出选中量 / 全模型参数量。
+# 指定范围且 k_percent=100：合并整个范围，跳过排名和贡献文件读取。
+layers: null
+modules: null
+
+# contribution: rank by CPVM contribution_channel.
+# delta_magnitude: rank by |theta_SFT - theta_base|.
+# finetuned_magnitude: rank by |theta_SFT|.
+# random: uniformly sample ceil(candidate_numel * k_percent / 100) scalars.
+# Random selection ignores contribution paths, channel, and selection_mode.
+ranking_method: "random"
+# Used only by random selection; recorded in the output name for reproducibility.
+seed: 0
+
+# contribution 排序模式：positive 按 C 从大到小固定取 Top-K（可跨过 0）；absolute 按 |C|。
+# 指定层/模块且 k_percent=100 时直接全选，忽略此项。
+selection_mode: "positive"
+
+# k_percent is a percentage of the candidate scope in [0, 100]. alpha=1 copies selected fine-tuned
+# values; alpha=0.5 moves selected values halfway from base to fine-tuned.
+k_percent: 5
+alpha: -1.0
+# true applies DaRE-style 1/q scaling to every selected delta, where
+# q=k_percent/100 within the candidate scope. The selected update is alpha * delta / q.
+# At k_percent=100, rescale_factor=1 even when use_weight_rescale=true.
+# With ranking_method=random and alpha=1 this is a fixed-count DARE variant.
+# Original DARE uses Bernoulli masks, keeping k_percent only in expectation.
+use_weight_rescale: true
+
+# Only provide a prefix. The code appends scope, ranking method, k, alpha, and scaling.
+experiment_name: "extraversion-low"
+
+# Example with rescaling:
+# extraversion-high-L_contrast-top-positive20pct-alpha1-dare-rescaled.
+# extraversion-high-delta-magnitude-top-20pct-alpha1-dare-rescaled.
+# extraversion-high-finetuned-magnitude-top-20pct-alpha1-dare-rescaled.
+# extraversion-high-random-keep-20pct-alpha1-dare-rescaled-seed0.
+# This cannot overwrite the previous absolute-value checkpoints.
+output_dir: "/mnt/nvme2/models/amadeus/cpvm_output/topk_merge"
+# auto preserves the base checkpoint dtype for every unselected parameter.
+merge_dtype: "auto"
+chunk_numel: 5000000
+max_shard_size: "5GB"

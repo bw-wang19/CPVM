@@ -1,0 +1,10 @@
+# --- 模型路径配置 ---
+base_model_path: "/mnt/nvme2/models/amadeus/model_zoo/qwen3-4b-instruct-2507"  # 底座模型
+lora_path: "/mnt/nvme2/models/amadeus/cpvm_output/sft/adapters/qwen3-4b-instruct-2507-lora-big5chat-conscientiousness-high-ep20"   # LoRA 权重路径
+output_path: "/mnt/nvme2/models/amadeus/cpvm_output/merged_model" # 输出路径
+
+# --- 合并参数 ---
+device_map: "auto"        # "auto", "cuda", or "cpu" (显存不够用 cpu)
+dtype: "bfloat16"     # "bfloat16", "float16", or "float32"
+safe_serialization: true  # 是否保存为 .safetensors (推荐 true)
+max_shard_size: "5GB"     # 权重切分大小

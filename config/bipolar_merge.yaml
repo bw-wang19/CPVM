@@ -1,0 +1,96 @@
+# 双极模型插值：high 对应 theta_plus，low 对应 theta_star。
+base_model_path: "/mnt/nvme2/models/amadeus/model_zoo/qwen3-4b-instruct-2507"
+plus_model_path: "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-high-ep10/checkpoint-1000"
+star_model_path: "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Extraversion-low-ep5/checkpoint-800"
+trait: "Extraversion"
+
+# 一次串行运行三条路径，每条路径独立选择一次 Top-K mask。
+# piecewise_linear：low -> base -> high，t=0 为 base。
+# endpoint_linear：low -> high 的直线，t=0 为两个稀疏端点的均值。
+# quadratic：经过 low(t=-1)、base(t=0)、high(t=1) 的二次插值曲线。
+# endpoint_linear 的归因 common 目录尚需先用 config/bipolar_path_integral_endpoint_linear.yaml 生成。
+# 已有 piecewise/quadratic 的 completeness 可用归因代码的 completeness_only 模式补算。
+# 只跑一条路径时，改用 path_method: "..." 和 contribution_dirs: {...}。
+path_methods:
+  piecewise_linear:
+    high: "/mnt/nvme2/models/amadeus/cpvm_output/path_integral/piecewise_linear/extraversion-high-low/high"
+    low: "/mnt/nvme2/models/amadeus/cpvm_output/path_integral/piecewise_linear/extraversion-high-low/low"
+  # endpoint_linear:
+  #   common: "/mnt/nvme2/models/amadeus/cpvm_output/path_integral/endpoint_linear/extraversion-high-low/common"
+  quadratic:
+    common: "/mnt/nvme2/models/amadeus/cpvm_output/path_integral/quadratic/extraversion-high-low/common"
+
+# 每条路径按这里的 t 顺序 merge 并立刻评测；单点也可改为 t: 0.25。
+t_values: [-1, -0.8, -0.6, -0.4, -0.2, 0, 0.2, 0.4, 0.6, 0.8, 1]
+
+# true：先按路径类型选择 mask，再在稀疏端点间构造上述路径。
+# 三条路径都只选择一个共同 mask，并同时作用于两个 endpoint-base delta。
+# piecewise_linear 将 high/low 两段贡献逐坐标合并后选一次 Top-K。
+# high/low 归因分别沿 base->high、base->low 且目标方向相反；low 侧
+# L_plus/L_star 与 high 侧的通道交换后，同名通道才对应同一 Score 方向。
+# 两段须使用相同归因数据和 use_original_prompt=false。
+#   d_high = alpha_high * rescale * mask * (theta_plus - theta_base)
+#   d_low  = alpha_low  * rescale * mask * (theta_star - theta_base)
+#   theta(t) = theta_base + c_high(t)*d_high + c_low(t)*d_low
+# false：直接使用完整 SFT 两端点；忽略 selection/pole_overrides/contribution_dirs，
+#        无需先运行路径归因，alpha/rescale 也不生效。
+# 贡献度来自完整 SFT 路径；筛选/缩放之后得到的是新的稀疏路径。
+sparsify: false
+
+# 所有路径使用这一套共同选择参数；high/low 共用同一个 K% 候选坐标集合。
+selection:
+  # contribution / delta_magnitude / finetuned_magnitude / random
+  # 所有路径的 delta_magnitude 按 |theta_plus - theta_star| 排序。
+  # finetuned_magnitude 按两端 |theta| 的逐坐标最大值排序。
+  ranking_method: "contribution"
+  contribution_channel: "L_contrast"  # L_plus / L_star / L_contrast；piecewise 会交换 low 侧对应通道
+  # positive 按 C 从大到小固定取 Top-K（可跨过 0）；absolute 按 |C|。
+  # 只有 contribution 排序使用 channel 和 selection_mode。
+  selection_mode: "positive"
+  # [0, 100] 内任意数值，可使用小数；分母是候选层/模块中的标量参数数量。
+  # 无范围限制时 k=100 选择全部参数，等价于不做 Top-K mask。
+  k_percent: 5.0
+  # 与 topk_merge 相同：layers/modules 同时配置时取交集。
+  # 例：layers: [0, 1, 2]；modules: ["self_attn.q_proj", "mlp"]。
+  # modules 多项取并集；父模块包含子模块；null 或 [] 表示不限制。
+  # piecewise_linear 的 k=100 总是跳过排名与贡献文件读取；其余路径指定范围时同样如此。
+  layers: null
+  modules: null
+  seed: 0  # 仅 random 使用；所有路径只用这一个 seed 生成共同 mask。
+  alpha: 1.0  # 两端默认 delta 缩放；可在 pole_overrides 中分别覆盖。
+  # true 时 delta 再乘 1/q，q=实际选中量/候选范围参数量；k=0 不可启用。
+  use_weight_rescale: false
+
+# 所有路径只允许为两个 endpoint 分别覆盖 alpha；K、seed、范围和排名必须共同。
+pole_overrides:
+  high:
+    alpha: 1.0
+  low:
+    alpha: 1.0
+
+experiment_name: "extraversion-high-low"
+output_dir: "/mnt/nvme2/models/amadeus/cpvm_output/bipolar_merge"
+
+# false: 每个 t 临时写一个完整模型供 vLLM/TRAIT 读取，所有评测结束立即删除。
+# 结果 JSON/CSV/PNG/SVG 永久保留；磁盘同时最多占用一个临时模型。
+# true: 保留各 t 的模型目录，供后续单独复测。
+save_models: false
+
+# 从已有测试 YAML 继承完整协议，但其中的 model_paths/output_path 会被当前 t 覆盖。
+# 可一次选择多个数据集；取消注释 GPQA 即可加入。需要临时改采样次数时，
+# 可写 gpqa: {config_path: ".../gpqa_test.yaml", overrides: {samples_per_question: 1}}。
+evaluations:
+  trait: {config_path: "/home/wbw/workspace/CPVM/config/trait_test.yaml", overrides: {personalities: "Extraversion"}}
+  # mmlu_pro: "/home/wbw/workspace/CPVM/config/mmlu_pro_test.yaml"
+  gpqa: {config_path: "/home/wbw/workspace/CPVM/config/gpqa_test.yaml", overrides: {samples_per_question: 2}}
+  aime25: {config_path: "/home/wbw/workspace/CPVM/config/aime25_test.yaml", overrides: {samples_per_question: 4}}
+  # 还可选择 aime25/gsm8k/math500/medmcqa，对应 config/<名称>_test.yaml。
+
+# 每条路径单独存 merge_summary.json；每个数据集单独存 CSV、SVG、PNG。
+# 所选路径都完成后，comparison/<experiment_name>/k<K>-rescale<0|1>/ 中
+# 保存对比图、完整 bipolar_merge_config.yaml 和 comparison_manifest.json。
+# 同名目录的完整配置不同时自动使用 run2、run3，避免覆盖旧图。
+# 各 t 复用一次选出的 mask，始终从同一个 base 重建。
+merge_dtype: "auto"  # auto / bfloat16 / float16 / float32
+chunk_numel: 5000000
+max_shard_size: "5GB"

@@ -1,0 +1,68 @@
+# 独立脚本：python -m CPVM.code.topk_curve --config CPVM/config/topk_curve.yaml
+merge_config_path: "/home/wbw/workspace/CPVM/config/topk_merge.yaml"
+# 直接在这里指定曲线的两个端点；不需要提前生成任何中间 Top-k 模型。
+base_model_path: "/mnt/nvme2/models/amadeus/model_zoo/qwen3-4b-instruct-2507"
+sft_model_path: "/mnt/nvme2/models/amadeus/cpvm_output/sft/full/qwen3-4b-instruct-2507-sft-full-big5chat-Conscientiousness-low-ep5/checkpoint-1000"
+# 只指定包含一对贡献矩阵的目录。程序自动识别 *-L_plus.safetensors 和
+# *-L_star.safetensors，并要求两者前缀完全一致；L_contrast 在运行时将两者相加。
+contribution_dir: "/mnt/nvme2/models/amadeus/cpvm_output/path_integral/qwen3-4b-instruct-2507-sft-full-big5chat-Conscientiousness-low-ep5-checkpoint-1000"
+# 该目录中的贡献矩阵必须由上面的 base/SFT 端点计算得到。
+trait_config_path: "/home/wbw/workspace/CPVM/config/trait_test.yaml"
+# 只读取 TRAIT 的题目/推理设置；强制 personalities=[main_trait]，只推理主属性题目。
+# 此处不使用 trait_test.yaml 的 model_paths、其他属性列表或多模型副本设置。
+# 沿用贡献分析的验证集划分、seed 和 prompt；使用完整 val，不沿用 max_samples=200。
+validation_config_path: "/home/wbw/workspace/CPVM/config/path_integral.yaml"
+main_trait: "Conscientiousness"
+target_level: "low"  # high / low；target 为此极，counter 自动取另一极。
+contribution_channel: "L_contrast"  # L_plus / L_star / L_contrast
+
+# 固定采样 0%、10%、...、100%；0=base，100=SFT。
+# 为与累计贡献曲线一致，此入口使用全局原始贡献度 C 降序、alpha=1，不读取层/模块限制。
+use_weight_rescale: false
+# 模型与贡献矩阵路径全部使用本文件中的设置。
+# 复用一个驻留模型，逐 k 从原始 base/SFT 权重在内存中合并，随后直接评测。
+# 不需要预先生成任何 k 的 checkpoint；本脚本不保存任何模型（包括临时模型）。
+# topk_merge 配置中的 output_dir/experiment_name/max_shard_size 不用于本脚本。
+
+# 验证集：复用 path_integral 的 original_index 划分、matched target/counter 配对及编码。
+# 每条回答先取 token 平均 NLL，再对有效配对等权平均；两侧使用同一批 prompt。
+# target 对应 target_level；counter 对应另一极。max_samples 按配对数计。
+# validation_loss 随 contribution_channel 切换（最小化方向）：
+#   L_plus:     NLL(target)
+#   L_star:    -NLL(counter)
+#   L_contrast: NLL(target) - NLL(counter)
+# 因此第三轴 -loss 分别为 -NLL(target)、+NLL(counter)、NLL(counter)-NLL(target)，
+# 正好对应归因目标；L_contrast 的贡献矩阵仍为 L_plus + L_star。
+# CSV 同时保存 target_nll、counter_nll、通道及 loss 定义，便于查看实际变化。
+validation_overrides:
+  val_ratio: 0.1
+  seed: 42
+  batch_size: 4
+  max_length: 1024
+  max_samples: null
+  dtype: "auto"
+  device_map: "auto"  # 权重需驻留 GPU/CPU 内存；不使用磁盘 offload。
+
+# 自动评测 base/SFT 的主属性分数；两端各只评测一次。
+# base（k=0%）/SFT（k=100%）分别对应整条参数路径的 alpha=0/1。
+# 第二轴固定为 0..100 的百分制，并按 10 分显示均匀刻度。
+# 第三轴先应用 loss_axis 的 negative / negative_log 显示变换，再设置范围：
+# k=0 的 base 显示值位于轴高 25%，所有 k 中的最高显示值位于轴高 80%。
+# 所有局部 view 共用同一 loss 范围，便于直接比较。
+# loss 端点仍可手动覆盖；null 使用本次测得的 base/SFT validation_loss。
+# 覆盖值必须使用所选通道的原始 validation_loss 定义，可为负数。
+base_validation_loss: null
+sft_validation_loss: null
+loss_axis: "negative"  # 仅改变第三条 y 轴的显示：画 -validation_loss，让越高代表越好。
+# 可选 negative_log 只用于正值的 L_plus，画 -log(validation_loss) 以压缩纵轴范围。
+
+# 重画已有 CSV 时改为 true，不再合并或评测模型。旧版缺少通道字段的 CSV 需重新计算。
+plot_only: false
+figure_width: 30
+dpi: 120
+# 需要原点放大可写 [100, 1, 0.1]；指标仅每10%测一次，连线不代表额外采样。
+view_limits_pct: [100]
+contribution_bins: 8192
+# 仅保存曲线、CSV 指标与 TRAIT 结果 JSON；这里不写模型权重。
+# 程序自动追加 <main_trait小写>-<target_level>/<contribution_channel>。
+output_root: "/mnt/nvme2/models/amadeus/cpvm_output/test/topk_curves"

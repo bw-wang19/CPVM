@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+WORKSPACE=/home/wbw/workspace
+CONFIG_PATH=${1:-/home/wbw/workspace/CPVM/config/dare_task_vector.yaml}
+PYTHON_BIN=${PYTHON_BIN:-python}
+
+cd "$WORKSPACE"
+"$PYTHON_BIN" -m CPVM.code.dare_task_vector_merge --config "$CONFIG_PATH"
